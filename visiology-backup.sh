@@ -37,14 +37,33 @@ error_output=/dev/null
 
 # Поведение при рассинхроне секретов Keycloak (см. --ignore-keycloak-secret-mismatch)
 IGNORE_KC_MISMATCH=0
+# Ноды ClickHouse: разрешить неполный дамп и выгрузка одной конкретной ноды
+ALLOW_PARTIAL_CH=0
+CH_ONLY_NODE=""
+CH_ONLY=0
 
 # Парсинг аргументов: -d/--debug (трассировка), -h/--help
 while [ "$1" != "" ]; do
     case "$1" in
         "-?" | "-h" | "--help")
-            echo "Usage: $0 [-d|--debug] [--ignore-keycloak-secret-mismatch] [-h|--help]"
+            echo "Usage: $0 [-d|--debug] [--ch-node N] [--allow-partial-clickhouse]"
+            echo "          [--ignore-keycloak-secret-mismatch] [-h|--help]"
             echo "  -d, --debug   режим отладки (трассировка команд, показ ошибок)"
             echo "  -h, --help    эта справка"
+            echo
+            echo "  --ch-node N   выгрузить только ноду ClickHouse с номером N."
+            echo "                Нужно, когда ноды CH разнесены по разным хостам:"
+            echo "                скрипт снимает LVM-снапшот ЛОКАЛЬНОГО корня и"
+            echo "                чужие ноды снять не может."
+            echo "  --ch-only     только ClickHouse: без postgres/keycloak/minio/"
+            echo "                секретов, без очистки backup/ и без упаковки."
+            echo "                Режим для дополнительных хостов CH: на каждом"
+            echo "                \"$0 --ch-only --ch-node N\", затем каталоги"
+            echo "                backup/clickhouse/clickhouse-N переносятся к"
+            echo "                основному хосту и пакуются вместе с ним."
+            echo "  --allow-partial-clickhouse"
+            echo "                не прерывать бэкап, если часть нод CH недоступна."
+            echo "                Архив помечается файлом CLICKHOUSE-PARTIAL.txt."
             echo
             echo "  --ignore-keycloak-secret-mismatch"
             echo "                не прерывать бэкап, если секрет клиента в Keycloak"
@@ -62,6 +81,19 @@ while [ "$1" != "" ]; do
             ;;
         "--ignore-keycloak-secret-mismatch")
             IGNORE_KC_MISMATCH=1
+            ;;
+        "--allow-partial-clickhouse")
+            ALLOW_PARTIAL_CH=1
+            ;;
+        "--ch-only")
+            CH_ONLY=1
+            ;;
+        "--ch-node")
+            shift
+            CH_ONLY_NODE="$1"
+            case "${CH_ONLY_NODE}" in
+                ''|*[!0-9]*) echo "--ch-node ждёт номер, получено: '${CH_ONLY_NODE}'"; exit 20 ;;
+            esac
             ;;
         *)
             echo "Неизвестный аргумент: $1"
@@ -95,9 +127,14 @@ SNAP_PV="/dev/sdg"
 
 CH_IMAGE="cr.yandex/crpe1mi33uplrq7coc9d/visiology/release/original/clickhouse-server:24.8.11.51285-alpine"
 CH_DB="visiology"
-CH_HOST_LABEL="clickhouse-1"
-CH_TEMP_NAME="ch_temp_backup"
+CH_TEMP_NAME="ch_temp_backup"     # префикс имени временных контейнеров
 CH_TEMP_PORT="9001"
+
+# Резерв на случай, если Swarm опросить не удалось. В норме номер ноды, имя
+# сервиса и имя тома определяются автоматически (detect_ch_nodes), потому что
+# при горизонтальном масштабировании CH нод становится несколько:
+# метка ноды v3-clickhouse-<N>, файл visiology3-ch-<N>.yml, свой том у каждой.
+CH_HOST_LABEL="clickhouse-1"
 CH_VOLUME="visiology3_clickhouse_data"
 CH_CPUS="4"
 CH_MEMORY="16g"
@@ -105,7 +142,7 @@ CH_CPU_SHARES="512"
 DUMP_PARALLEL="4"
 
 SNAP_MNT="/mnt/vis_snap"
-CH_COPY_DIR="/mnt/disk2/vis_ch_copy"   # копия данных CH (на ней работает временный CH)
+CH_COPY_DIR="/mnt/disk2/vis_ch_copy"   # копии данных CH: <CH_COPY_DIR>/<номер ноды>
 
 if command -v pigz >/dev/null 2>&1; then
     COMPRESSOR="pigz -p ${CH_CPUS}"
@@ -291,10 +328,10 @@ _remove_snapshot() {
 cleanup() {
     local rc=$?
     log "очистка CH-ресурсов..."
-    if [ "${CH_STARTED}" = "1" ] || sudo docker ps -a --format '{{.Names}}' | grep -q "^${CH_TEMP_NAME}$"; then
-        sudo docker stop "${CH_TEMP_NAME}" >/dev/null 2>&1 || true
-        sudo docker rm   "${CH_TEMP_NAME}" >/dev/null 2>&1 || true
-    fi
+    # Временных контейнеров может быть несколько (по одному на ноду CH).
+    sudo docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${CH_TEMP_NAME}" | while IFS= read -r n; do
+        sudo docker rm -f "${n}" >/dev/null 2>&1 || true
+    done
     if [ "${SNAP_MOUNTED}" = "1" ] || mountpoint -q "${SNAP_MNT}" 2>/dev/null; then
         _umount_lazy "${SNAP_MNT}"
     fi
@@ -312,10 +349,182 @@ cleanup() {
 trap 'trap "" INT TERM; cleanup' EXIT
 trap 'exit 130' INT TERM
 
-dump_clickhouse() {
-    log "ClickHouse: снапшот и выгрузка..."
+# Опрос Swarm: какие ноды ClickHouse есть, на каком томе и на каком хосте.
+# Имена томов не угадываем - берём из спецификации сервиса, иначе при
+# переименовании или при второй ноде получили бы молча неполный дамп.
+# Формат строки: <номер>|<сервис>|<том>|<хост>
+detect_ch_nodes() {
+    docker service ls --format '{{.Name}}' 2>/dev/null \
+        | grep -E "^${PROJECT}_clickhouse" \
+        | grep -viE 'jdbc|bridge|keeper|zookeeper' \
+        | sort \
+        | while IFS= read -r svc; do
+            local idx vol node
+            idx="${svc##*-}"
+            case "${idx}" in ''|*[!0-9]*) idx=1 ;; esac
+            vol=$(docker service inspect "${svc}" --format \
+                '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{if eq .Target "/var/lib/clickhouse"}}{{.Source}}{{end}}{{end}}' 2>/dev/null) || vol=""
+            node=$(docker service ps "${svc}" --filter desired-state=running --format '{{.Node}}' 2>/dev/null | head -1) || node=""
+            printf '%s|%s|%s|%s\n' "${idx}" "${svc}" "${vol}" "${node}"
+        done
+}
 
-    sudo docker rm -f "${CH_TEMP_NAME}" >/dev/null 2>&1 || true
+# Выгрузка ОДНОЙ ноды CH с уже готовой копии данных.
+#   $1 - номер ноды, $2 - каталог с копией /var/lib/clickhouse этой ноды
+_dump_ch_node() {
+    local idx="$1" copy_dir="$2"
+    local cname="${CH_TEMP_NAME}_${idx}"
+    local ch_conf_dir="/tmp/vis_ch_conf"
+
+    log "  нода ${idx}: временный CH (${CH_CPUS} ядер, ${CH_MEMORY})"
+    sudo docker rm -f "${cname}" >/dev/null 2>&1 || true
+    sudo docker run -d \
+        --name "${cname}" \
+        --user 101:101 \
+        --cpus="${CH_CPUS}" --memory="${CH_MEMORY}" --cpu-shares="${CH_CPU_SHARES}" \
+        -v "${copy_dir}:/var/lib/clickhouse" \
+        -v "${ch_conf_dir}/zz-backup-quiet.xml:/etc/clickhouse-server/config.d/zz-backup-quiet.xml:ro" \
+        -p "${CH_TEMP_PORT}:9000" \
+        --ulimit nofile=262144:262144 \
+        -e CLICKHOUSE_SKIP_USER_SETUP=1 \
+        "${CH_IMAGE}" >/dev/null
+    CH_STARTED=1
+
+    local ok=0 i
+    for i in $(seq 1 90); do
+        if sudo docker exec "${cname}" clickhouse-client --query "SELECT 1" >/dev/null 2>&1; then
+            ok=1; break
+        fi
+        if ! sudo docker ps --format '{{.Names}}' | grep -q "^${cname}$"; then
+            sudo docker logs "${cname}" 2>&1 | tail -20 | while IFS= read -r l; do log "      ${l}"; done
+            die "нода ${idx}: временный CH упал при старте"
+        fi
+        sleep 2
+    done
+    [ "${ok}" = "1" ] || { sudo docker logs "${cname}" 2>&1 | tail -20; die "нода ${idx}: временный CH не поднялся"; }
+
+    sudo docker exec "${cname}" clickhouse-client --query "SYSTEM STOP MERGES" >/dev/null 2>&1 || true
+    sudo docker exec "${cname}" clickhouse-client --query "SYSTEM STOP MOVES"  >/dev/null 2>&1 || true
+    sudo docker exec "${cname}" clickhouse-client --query "EXISTS DATABASE ${CH_DB}" | grep -q 1 \
+        || die "нода ${idx}: временный CH не видит базу ${CH_DB}"
+
+    local ch_base="${MAIN_BACKUP_DIR}/clickhouse/clickhouse-${idx}"
+    local sql_dir="${ch_base}/sql"
+    local data_dir="${ch_base}/data"
+    sudo mkdir -p "${sql_dir}" "${data_dir}"
+    sudo chown -R "$(id -u):$(id -g)" "${MAIN_BACKUP_DIR}/clickhouse"
+
+    local tables_file
+    tables_file=$(mktemp)
+    sudo docker exec "${cname}" clickhouse-client -d "${CH_DB}" -q "SHOW TABLES FORMAT TSVRaw" \
+        | grep -v 'jemalloc' | grep -v '^cache_queries_' > "${tables_file}" || true
+    local total
+    total=$(wc -l < "${tables_file}")
+    [ "${total}" -gt 0 ] || die "нода ${idx}: не получен список таблиц"
+    log "  нода ${idx}: таблиц к выгрузке: ${total}"
+
+    # Справочно: View/MaterializedView/Dictionary выгружаются как обычные таблицы
+    # (SELECT * ... FORMAT Native), и при restore INSERT в них может не пройти.
+    local odd
+    odd=$(sudo docker exec "${cname}" clickhouse-client -q \
+        "SELECT engine || ': ' || toString(count()) FROM system.tables
+         WHERE database='${CH_DB}' AND (engine LIKE '%View' OR engine='Dictionary')
+         GROUP BY engine FORMAT TSVRaw" 2>/dev/null) || odd=""
+    if [ -n "${odd}" ]; then
+        warn "нода ${idx}: есть представления/словари, они попадут в дамп как обычные таблицы:"
+        printf '%s\n' "${odd}" | while IFS= read -r l; do warn "    ${l}"; done
+    fi
+
+    local err_dir
+    err_dir=$(mktemp -d)
+    export CH_TEMP_NAME CH_DB sql_dir data_dir err_dir
+    export cname
+    _dump_one() {
+        local table="$1"
+        [ -n "${table}" ] || return 0
+        if ! sudo docker exec "${cname}" clickhouse-client -d "${CH_DB}" \
+                -q "SHOW CREATE TABLE \"${table}\"" --format TabSeparatedRaw \
+                > "${sql_dir}/${table}.sql" 2>"${err_dir}/${table}.err"; then
+            rm -f "${sql_dir}/${table}.sql" "${data_dir}/${table}"; return 1
+        fi
+        if ! sudo docker exec "${cname}" clickhouse-client -d "${CH_DB}" \
+                -q "SELECT * FROM \"${table}\" FORMAT Native" \
+                > "${data_dir}/${table}" 2>>"${err_dir}/${table}.err"; then
+            # ВАЖНО: удаляем и .sql тоже, иначе таблица считалась выгруженной,
+            # хотя данных для неё в архиве нет.
+            rm -f "${data_dir}/${table}" "${sql_dir}/${table}.sql"; return 1
+        fi
+        rm -f "${err_dir}/${table}.err"; return 0
+    }
+    export -f _dump_one
+
+    xargs -P "${DUMP_PARALLEL}" -I {} bash -c '_dump_one "$@"' _ {} < "${tables_file}" || true
+
+    local done_cnt failed_cnt
+    done_cnt=$(find "${sql_dir}" -name '*.sql' | wc -l)
+    failed_cnt=$(find "${err_dir}" -name '*.err' | wc -l)
+    log "  нода ${idx}: выгружено таблиц ${done_cnt} из ${total}"
+
+    # Раньше проверялось только "выгружена хотя бы одна таблица" - неполный дамп
+    # уезжал в архив как успешный и вскрывался только на restore.
+    if [ "${failed_cnt}" -gt 0 ] || [ "${done_cnt}" -ne "${total}" ]; then
+        warn "нода ${idx}: не выгружено таблиц $(( total - done_cnt )), ошибок: ${failed_cnt}"
+        find "${err_dir}" -name '*.err' -printf '%f\n' 2>/dev/null | head -10 \
+            | while IFS= read -r f; do warn "    ${f%.err}"; done
+        rm -rf "${err_dir}" "${tables_file}"
+        die "нода ${idx}: ClickHouse выгружен не полностью - архив собирать нельзя"
+    fi
+
+    rm -rf "${err_dir}" "${tables_file}"
+    sudo docker rm -f "${cname}" >/dev/null 2>&1 || true
+}
+
+dump_clickhouse() {
+    log "ClickHouse: опрос нод..."
+
+    local -a nodes=()
+    mapfile -t nodes < <(detect_ch_nodes)
+    if [ ${#nodes[@]} -eq 0 ]; then
+        warn "Swarm опросить не удалось, беру значения из конфигурации: ${CH_HOST_LABEL} / ${CH_VOLUME}"
+        local fallback_idx="${CH_HOST_LABEL##*-}"
+        case "${fallback_idx}" in ''|*[!0-9]*) fallback_idx=1 ;; esac
+        nodes=("${fallback_idx}|${PROJECT}_clickhouse|${CH_VOLUME}|$(hostname)")
+    fi
+
+    # CLICKHOUSE_COUNT задаётся в defaults.env при горизонтальном масштабировании.
+    if [ -n "${CLICKHOUSE_COUNT:-}" ] && [ "${CLICKHOUSE_COUNT}" != "${#nodes[@]}" ]; then
+        warn "CLICKHOUSE_COUNT=${CLICKHOUSE_COUNT}, а найдено сервисов CH: ${#nodes[@]}"
+    fi
+
+    local local_name
+    local_name=$(docker info --format '{{.Name}}' 2>/dev/null) || local_name=""
+    [ -n "${local_name}" ] || local_name=$(hostname)
+
+    local -a locals=() remotes=()
+    local line idx svc vol node
+    for line in "${nodes[@]}"; do
+        IFS='|' read -r idx svc vol node <<< "${line}"
+        [ -n "${vol}" ] || die "не удалось определить том данных для сервиса ${svc}"
+        if [ -n "${CH_ONLY_NODE}" ] && [ "${idx}" != "${CH_ONLY_NODE}" ]; then
+            log "  нода ${idx} (${svc}): пропущена по --ch-node ${CH_ONLY_NODE}"
+            continue
+        fi
+        if [ -z "${node}" ] || [ "${node}" = "${local_name}" ] || [ "${node}" = "$(hostname)" ]; then
+            locals+=("${idx}|${vol}")
+            log "  нода ${idx}: ${svc}, том ${vol} - локальная"
+        else
+            remotes+=("${idx}|${svc}|${node}")
+            warn "нода ${idx}: ${svc} работает на хосте ${node} - LVM-снапшот отсюда её не видит"
+        fi
+    done
+
+    [ ${#locals[@]} -gt 0 ] || die "нет ни одной локальной ноды ClickHouse для выгрузки"
+
+    log "ClickHouse: снапшот и выгрузка (${#locals[@]} нод)..."
+
+    sudo docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${CH_TEMP_NAME}" | while IFS= read -r n; do
+        sudo docker rm -f "${n}" >/dev/null 2>&1 || true
+    done
     if sudo lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
         _umount_lazy "${SNAP_MNT}"; _remove_snapshot || true
     fi
@@ -331,18 +540,24 @@ dump_clickhouse() {
     sudo mount -o ro "/dev/${VG_NAME}/${SNAP_NAME}" "${SNAP_MNT}"
     SNAP_MOUNTED=1
 
-    local ch_data_in_snap="${SNAP_MNT}/var/lib/docker/volumes/${CH_VOLUME}/_data"
-    [ -d "${ch_data_in_snap}" ] || die "в снапшоте нет данных CH"
-
     # Копируем данные CH из снапшота, затем снапшот сразу удаляем.
     # Снапшот живёт только на время cp (минуты) - COW не успевает переполниться
     # от записи боевой системы в корень. Выгрузка идёт с копии.
-    log "  копирую данные CH в ${CH_COPY_DIR}..."
+    # Снапшот один на все локальные ноды: срез получается одномоментным сразу
+    # для всех шардов. Место под копии нужно суммарно по всем локальным нодам,
+    # каждая копия удаляется сразу после выгрузки своей ноды.
+    log "  копирую данные CH..."
     sudo rm -rf "${CH_COPY_DIR}"
     sudo mkdir -p "${CH_COPY_DIR}"
     CH_COPY_CREATED=1
-    sudo cp -a "${ch_data_in_snap}/." "${CH_COPY_DIR}/"
-    log "  копия готова: $(sudo du -sh "${CH_COPY_DIR}" 2>/dev/null | cut -f1)"
+    for line in "${locals[@]}"; do
+        IFS='|' read -r idx vol <<< "${line}"
+        local src="${SNAP_MNT}/var/lib/docker/volumes/${vol}/_data"
+        [ -d "${src}" ] || die "нода ${idx}: в снапшоте нет данных тома ${vol}"
+        sudo mkdir -p "${CH_COPY_DIR}/${idx}"
+        sudo cp -a "${src}/." "${CH_COPY_DIR}/${idx}/"
+        log "  нода ${idx}: копия готова ($(sudo du -sh "${CH_COPY_DIR}/${idx}" 2>/dev/null | cut -f1))"
+    done
 
     # снапшот больше не нужен - удаляем сразу (COW освобождается)
     log "  удаляю снапшот"
@@ -378,105 +593,33 @@ dump_clickhouse() {
 </clickhouse>
 XMLEOF
 
-    log "  временный CH (${CH_CPUS} ядер, ${CH_MEMORY})"
-    sudo docker run -d \
-        --name "${CH_TEMP_NAME}" \
-        --user 101:101 \
-        --cpus="${CH_CPUS}" --memory="${CH_MEMORY}" --cpu-shares="${CH_CPU_SHARES}" \
-        -v "${CH_COPY_DIR}:/var/lib/clickhouse" \
-        -v "${ch_conf_dir}/zz-backup-quiet.xml:/etc/clickhouse-server/config.d/zz-backup-quiet.xml:ro" \
-        -p "${CH_TEMP_PORT}:9000" \
-        --ulimit nofile=262144:262144 \
-        -e CLICKHOUSE_SKIP_USER_SETUP=1 \
-        "${CH_IMAGE}" >/dev/null
-    CH_STARTED=1
-
-    local ok=0 i
-    for i in $(seq 1 90); do
-        if sudo docker exec "${CH_TEMP_NAME}" clickhouse-client --query "SELECT 1" >/dev/null 2>&1; then
-            ok=1; break
-        fi
-        if ! sudo docker ps --format '{{.Names}}' | grep -q "^${CH_TEMP_NAME}$"; then
-            sudo docker logs "${CH_TEMP_NAME}" 2>&1 | tail -20 | while IFS= read -r l; do log "      ${l}"; done
-            die "временный CH упал при старте"
-        fi
-        sleep 2
+    for line in "${locals[@]}"; do
+        IFS='|' read -r idx vol <<< "${line}"
+        _dump_ch_node "${idx}" "${CH_COPY_DIR}/${idx}"
+        # копию удаляем сразу - на многонодовой установке иначе нужен суммарный объём
+        sudo rm -rf "${CH_COPY_DIR:?}/${idx}" >/dev/null 2>&1 || true
     done
-    [ "${ok}" = "1" ] || { sudo docker logs "${CH_TEMP_NAME}" 2>&1 | tail -20; die "временный CH не поднялся"; }
 
-    sudo docker exec "${CH_TEMP_NAME}" clickhouse-client --query "SYSTEM STOP MERGES" >/dev/null 2>&1 || true
-    sudo docker exec "${CH_TEMP_NAME}" clickhouse-client --query "SYSTEM STOP MOVES"  >/dev/null 2>&1 || true
-    sudo docker exec "${CH_TEMP_NAME}" clickhouse-client --query "EXISTS DATABASE ${CH_DB}" | grep -q 1 \
-        || die "временный CH не видит базу ${CH_DB}"
-
-    local ch_base="${MAIN_BACKUP_DIR}/clickhouse/${CH_HOST_LABEL}"
-    local sql_dir="${ch_base}/sql"
-    local data_dir="${ch_base}/data"
-    sudo mkdir -p "${sql_dir}" "${data_dir}"
-    sudo chown -R "$(id -u):$(id -g)" "${MAIN_BACKUP_DIR}/clickhouse"
-
-    local tables_file
-    tables_file=$(mktemp)
-    sudo docker exec "${CH_TEMP_NAME}" clickhouse-client -d "${CH_DB}" -q "SHOW TABLES FORMAT TSVRaw" \
-        | grep -v 'jemalloc' | grep -v '^cache_queries_' > "${tables_file}" || true
-    local total
-    total=$(wc -l < "${tables_file}")
-    [ "${total}" -gt 0 ] || die "не получен список таблиц"
-    log "  таблиц к выгрузке: ${total}"
-
-    # Справочно: движки таблиц. View/MaterializedView/Dictionary выгружаются как
-    # обычные таблицы (SELECT * ... FORMAT Native), и при restore INSERT в них
-    # может не пройти. Если строки ниже не пустые - сверьтесь со штатным архивом.
-    local odd
-    odd=$(sudo docker exec "${CH_TEMP_NAME}" clickhouse-client -q \
-        "SELECT engine || ': ' || toString(count()) FROM system.tables
-         WHERE database='${CH_DB}' AND (engine LIKE '%View' OR engine='Dictionary')
-         GROUP BY engine FORMAT TSVRaw" 2>/dev/null) || odd=""
-    if [ -n "${odd}" ]; then
-        warn "в базе есть представления/словари, они попадут в дамп как обычные таблицы:"
-        printf '%s\n' "${odd}" | while IFS= read -r l; do warn "    ${l}"; done
-    fi
-
-    local err_dir
-    err_dir=$(mktemp -d)
-    export CH_TEMP_NAME CH_DB sql_dir data_dir err_dir
-    _dump_one() {
-        local table="$1"
-        [ -n "${table}" ] || return 0
-        if ! sudo docker exec "${CH_TEMP_NAME}" clickhouse-client -d "${CH_DB}" \
-                -q "SHOW CREATE TABLE \"${table}\"" --format TabSeparatedRaw \
-                > "${sql_dir}/${table}.sql" 2>"${err_dir}/${table}.err"; then
-            rm -f "${sql_dir}/${table}.sql" "${data_dir}/${table}"; return 1
+    if [ ${#remotes[@]} -gt 0 ]; then
+        local r ridx rsvc rnode
+        for r in "${remotes[@]}"; do
+            IFS='|' read -r ridx rsvc rnode <<< "${r}"
+            if [ "${ALLOW_PARTIAL_CH}" = "1" ]; then
+                echo "нода ${ridx} (${rsvc}) на хосте ${rnode} в архив НЕ попала" >> "${MAIN_BACKUP_DIR}/CLICKHOUSE-PARTIAL.txt"
+            fi
+        done
+        if [ "${ALLOW_PARTIAL_CH}" = "1" ]; then
+            warn "ClickHouse выгружен частично, см. ${MAIN_BACKUP_DIR}/CLICKHOUSE-PARTIAL.txt"
+        else
+            die "нод ClickHouse на других хостах: ${#remotes[@]}.
+     Скрипт снимает LVM-снапшот ЛОКАЛЬНОГО корня и чужие ноды снять не может.
+     Данные CH шардированы: архив без них будет неполным, а выглядеть будет успешным.
+     Варианты:
+       1) запустить скрипт на каждом хосте с --ch-node <номер> и объединить
+          каталоги backup/clickhouse/clickhouse-<N> в один архив;
+       2) осознанно собрать неполный архив: $0 --allow-partial-clickhouse"
         fi
-        if ! sudo docker exec "${CH_TEMP_NAME}" clickhouse-client -d "${CH_DB}" \
-                -q "SELECT * FROM \"${table}\" FORMAT Native" \
-                > "${data_dir}/${table}" 2>>"${err_dir}/${table}.err"; then
-            # ВАЖНО: удаляем и .sql тоже, иначе таблица считалась выгруженной,
-            # хотя данных для неё в архиве нет.
-            rm -f "${data_dir}/${table}" "${sql_dir}/${table}.sql"; return 1
-        fi
-        rm -f "${err_dir}/${table}.err"; return 0
-    }
-    export -f _dump_one
-
-    xargs -P "${DUMP_PARALLEL}" -I {} bash -c '_dump_one "$@"' _ {} < "${tables_file}" || true
-
-    local done_cnt failed_cnt
-    done_cnt=$(find "${sql_dir}" -name '*.sql' | wc -l)
-    failed_cnt=$(find "${err_dir}" -name '*.err' | wc -l)
-    log "  выгружено таблиц: ${done_cnt} из ${total}"
-
-    # Раньше проверялось только "выгружена хотя бы одна таблица" - неполный дамп
-    # уезжал в архив как успешный и вскрывался только на restore.
-    if [ "${failed_cnt}" -gt 0 ] || [ "${done_cnt}" -ne "${total}" ]; then
-        warn "не выгружено таблиц: $(( total - done_cnt )), ошибок: ${failed_cnt}"
-        find "${err_dir}" -name '*.err' -printf '%f\n' 2>/dev/null | head -10 \
-            | while IFS= read -r f; do warn "    ${f%.err}"; done
-        rm -rf "${err_dir}" "${tables_file}"
-        die "ClickHouse выгружен не полностью - архив собирать нельзя"
     fi
-
-    rm -rf "${err_dir}" "${tables_file}"
 }
 
 ########################################
@@ -484,6 +627,13 @@ XMLEOF
 ########################################
 t_start=$(date +%s)
 log "=== СТАРТ полного бэкапа Visiology ==="
+
+if [ "${CH_ONLY}" = "1" ]; then
+    # Режим дополнительного хоста CH: каталог backup/ не трогаем и ничего,
+    # кроме ClickHouse, не собираем - на этом хосте остальных сервисов нет.
+    log "режим --ch-only: только ClickHouse"
+    mkdir -p "${MAIN_BACKUP_DIR}"
+else
 
 rm -rf "${MAIN_BACKUP_DIR:?}"/*
 mkdir -p "${MAIN_BACKUP_DIR}"
@@ -592,7 +742,17 @@ else
     log "  ! onec-connector не найден, onec-secret пропущен"
 fi
 
+fi   # конец блока, пропускаемого при --ch-only
+
 dump_clickhouse
+
+if [ "${CH_ONLY}" = "1" ]; then
+    t_end=$(date +%s)
+    log "=== ГОТОВО за ~$(( (t_end - t_start) / 60 )) мин (только ClickHouse) ==="
+    log "Каталоги: ${MAIN_BACKUP_DIR}/clickhouse/"
+    log "Перенесите их на основной хост в ту же папку и упакуйте вместе с остальным бэкапом."
+    exit 0
+fi
 
 archive_name="$(hostname)-backup-v${VERSION}-$(date '+%Y-%m-%d-%H-%M-%S').tar.gz"
 backup_file_dir=$(dirname "$(readlink -f "${BACKUP_DIR}/${archive_name}")")
