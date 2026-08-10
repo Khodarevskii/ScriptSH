@@ -20,18 +20,37 @@
 #   4. minio, секреты
 #   5. ClickHouse через LVM-снапшот -> Native-выгрузка
 #   6. tar один раз -> финальный архив
+#
+# ------------------------------------------------------------------------------
+# ВАЖНО ПРО KEYCLOAK (причина, по которой прошлые архивы не поднимались):
+# секреты из /run/secrets ЧИТАЮТСЯ ТОЛЬКО ЧЕРЕЗ `docker exec -i` (без -t).
+# С флагом -t docker выделяет псевдотерминал, tty-дисциплина превращает \n в \r\n,
+# и в переменную попадает хвостовой \r. Такой шаблон sed не находит в realm-json ->
+# подмена на болванку молча не срабатывает -> в архиве остаются секреты ИСХОДНОГО
+# стенда -> restore.sh не находит болванок, не подставляет секреты целевого стенда ->
+# invalid_client_credentials. Подробности и порядок лечения: ИСПРАВЛЕНИЯ.md
+# ------------------------------------------------------------------------------
 
 # Версия платформы (определяется после source config.env - см. ниже).
 COMMAND_LINE="$0 $*"
 error_output=/dev/null
 
+# Поведение при рассинхроне секретов Keycloak (см. --ignore-keycloak-secret-mismatch)
+IGNORE_KC_MISMATCH=0
+
 # Парсинг аргументов: -d/--debug (трассировка), -h/--help
 while [ "$1" != "" ]; do
     case "$1" in
         "-?" | "-h" | "--help")
-            echo "Usage: $0 [-d|--debug] [-h|--help]"
+            echo "Usage: $0 [-d|--debug] [--ignore-keycloak-secret-mismatch] [-h|--help]"
             echo "  -d, --debug   режим отладки (трассировка команд, показ ошибок)"
             echo "  -h, --help    эта справка"
+            echo
+            echo "  --ignore-keycloak-secret-mismatch"
+            echo "                не прерывать бэкап, если секрет клиента в Keycloak"
+            echo "                не совпадает с docker secret. Архив в этом случае"
+            echo "                помечается файлом KEYCLOAK-SECRETS-NOT-NORMALIZED.txt"
+            echo "                и потребует ручной синхронизации после restore."
             echo
             echo "Полный бэкап Visiology (postgres, smartforms, minio, keycloak,"
             echo "секреты, custom) + консистентный ClickHouse через LVM-снапшот."
@@ -41,6 +60,9 @@ while [ "$1" != "" ]; do
             set -x
             error_output=/dev/fd/1
             ;;
+        "--ignore-keycloak-secret-mismatch")
+            IGNORE_KC_MISMATCH=1
+            ;;
         *)
             echo "Неизвестный аргумент: $1"
             echo "См. справку: $0 -h"
@@ -49,6 +71,9 @@ while [ "$1" != "" ]; do
     esac
     shift
 done
+
+# Ошибка в любом звене конвейера должна валить шаг, а не проглатываться.
+set -o pipefail
 
 SCRIPT_DIR=$( dirname -- "$( readlink -f -- "$0")")
 pushd "${SCRIPT_DIR}" >/dev/null
@@ -101,15 +126,143 @@ EXTENDED_SERVICES_PATH="extended-services"
 ENV_FILES_PATH="env-files"
 CUSTOM_CONFIGS_PATH="custom-configs"
 COMMAND_FILE="command.txt"
+REALM_FILE="${MAIN_BACKUP_DIR}/visiology-realm.json"
+KC_MAP_FILE="${MAIN_BACKUP_DIR}/keycloak-clients.map"
+KC_WARN_FILE="${MAIN_BACKUP_DIR}/KEYCLOAK-SECRETS-NOT-NORMALIZED.txt"
 
 LOG_TAG="[visiology-backup]"
 log() { echo "$(date '+%F %T') ${LOG_TAG} $*"; }
+warn() { echo "$(date '+%F %T') ${LOG_TAG} ВНИМАНИЕ: $*" >&2; }
 die() { echo "$(date '+%F %T') ${LOG_TAG} ОШИБКА: $*" >&2; exit 1; }
 
 CH_STARTED=0
 SNAP_MOUNTED=0
 SNAP_CREATED=0
 CH_COPY_CREATED=0
+
+########################################
+# Общие помощники
+########################################
+
+# Поиск контейнера по подстроке имени. Через docker ps --filter, а не
+# `docker ps | grep`: grep ловит совпадения и в колонке IMAGE, а при нескольких
+# совпавших строках awk вернёт несколько ID через пробел и docker exec сломается.
+resolve_container() {
+    docker ps --filter "name=$1" --format '{{.ID}}' | head -1
+}
+
+# То же, но с обязательным наличием контейнера.
+require_container() {
+    local cid
+    cid=$(resolve_container "$1") || true
+    [ -n "${cid}" ] || die "контейнер '$2' не найден (фильтр имени: $1)"
+    printf '%s' "${cid}"
+}
+
+# Чтение ЗНАЧЕНИЯ секрета для подстановки в sed.
+# ТОЛЬКО -i, без -t (см. блок ВАЖНО ПРО KEYCLOAK в шапке).
+# tr -d '\r\n' - страховка на случай, если сам файл секрета создан с переводом строки.
+read_secret_value() {
+    local cid="$1" name="$2" val
+    val=$(docker exec -i "${cid}" cat "/run/secrets/${name}" 2>/dev/null | tr -d '\r\n') || true
+    [ -n "${val}" ] || die "секрет ${name} пуст или недоступен в контейнере ${cid}"
+    printf '%s' "${val}"
+}
+
+# Копирование секрета В ФАЙЛ архива - байт-в-байт, БЕЗ нормализации.
+# Здесь \r\n убирать НЕЛЬЗЯ: restore.sh отдаёт этот файл в `docker secret create`,
+# и секрет должен восстановиться ровно тем же набором байт, иначе Fernet-ключи
+# (DATA_MANAGEMENT_SECRET_KEY, ONEC_CONNECTOR_FERNET) перестанут расшифровывать данные.
+# Отличие от штатного скрипта: '>' вместо '>>' (append при повторном прогоне
+# склеивал два ключа в один файл) и проверка, что файл не пустой.
+copy_secret_file() {
+    local cid="$1" name="$2" out="$3"
+    docker exec -i "${cid}" cat "/run/secrets/${name}" > "${out}" \
+        || die "не удалось прочитать секрет ${name} из контейнера ${cid}"
+    [ -s "${out}" ] || die "секрет ${name} сохранён пустым: ${out}"
+}
+
+# Экранирование для sed: BRE-шаблон и строка замены (разделитель '/').
+_esc_bre()  { printf '%s' "$1" | sed 's@[][\\.*^$/]@\\&@g'; }
+_esc_repl() { printf '%s' "$1" | sed 's@[\\&/]@\\&@g'; }
+
+# Подмена секрета в realm-json с проверкой ДО и ПОСЛЕ.
+# Именно отсутствие этих проверок делало поломку невидимой: sed возвращает 0,
+# даже когда не нашёл ни одного совпадения.
+replace_in_realm() {
+    local old="$1" new="$2" label="$3"
+
+    [ -n "${old}" ] || die "${label}: пустое исходное значение секрета"
+    [ -n "${new}" ] || die "${label}: пустая болванка"
+
+    if ! grep -qF -- "${old}" "${REALM_FILE}"; then
+        if [ "${IGNORE_KC_MISMATCH}" = "1" ]; then
+            warn "${label}: значение из /run/secrets не найдено в visiology-realm.json - подмена пропущена"
+            echo "${label}: секрет клиента в Keycloak не совпадает с docker secret, болванка не подставлена" >> "${KC_WARN_FILE}"
+            return 0
+        fi
+        die "${label}: значение из /run/secrets НЕ НАЙДЕНО в visiology-realm.json.
+     Это ровно та ситуация, из-за которой архив потом не поднимается: restore.sh
+     не найдёт болванку и оставит в realm секреты чужого стенда.
+     Возможные причины:
+       1) секрет клиента в Keycloak разошёлся с docker secret на ЭТОМ стенде -
+          синхронизируйте: ./visiology-keycloak-sync.sh
+       2) kc.sh export отдал устаревший/неполный realm - проверьте вывод с -d
+     Обойти проверку осознанно: $0 --ignore-keycloak-secret-mismatch"
+    fi
+
+    sed -i "s/$(_esc_bre "${old}")/$(_esc_repl "${new}")/g" "${REALM_FILE}"
+
+    grep -qF -- "${new}" "${REALM_FILE}" || die "${label}: болванка не появилась в realm-json"
+    if grep -qF -- "${old}" "${REALM_FILE}"; then
+        die "${label}: исходный секрет остался в realm-json после подмены"
+    fi
+    log "  ${label}: подменён на болванку"
+}
+
+# Карта "имя docker secret -> clientId" по фактическим значениям секретов.
+# Кладётся в архив и позволяет после restore точечно синхронизировать секреты
+# (visiology-keycloak-sync.sh), не угадывая clientId руками.
+# Секреты передаются в python ТОЛЬКО через stdin - в argv/ps они не светятся.
+write_keycloak_client_map() {
+    command -v python3 >/dev/null 2>&1 || { warn "python3 не найден, keycloak-clients.map не создан"; return 0; }
+    local py; py=$(mktemp)
+    cat > "${py}" <<'PYEOF'
+import json, sys
+realm_path, out_path = sys.argv[1], sys.argv[2]
+pairs = {}
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    name, _, value = line.partition("=")
+    pairs[value] = name
+with open(realm_path, encoding="utf-8") as fh:
+    realm = json.load(fh)
+found = []
+for client in realm.get("clients", []):
+    name = pairs.get(client.get("secret"))
+    if name:
+        found.append("%s=%s" % (name, client.get("clientId", "")))
+with open(out_path, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(sorted(set(found))) + ("\n" if found else ""))
+print(len(found))
+PYEOF
+    local cnt
+    cnt=$(printf '%s\n' \
+        "KEYCLOAK_M2M_SECRET=${m2m_secret}" \
+        "KEYCLOAK_GRAFANA_CLIENT_SECRET=${grafana_client_secret}" \
+        "KEYCLOAK_PUBLIC_DASHBOARD_ACCESS_SECRET=${public_dashboard_access_secret}" \
+        "KEYCLOAK_VISIOLOGY_ADMIN_REALM_SECRET=${visiology_admin_realm_secret}" \
+        | python3 "${py}" "${REALM_FILE}" "${KC_MAP_FILE}") || cnt=""
+    rm -f "${py}"
+    if [ -n "${cnt}" ]; then
+        log "  карта клиентов keycloak: сопоставлено ${cnt} из 4"
+        [ "${cnt}" = "4" ] || warn "не все секреты сопоставлены с клиентами Keycloak (см. ${KC_MAP_FILE})"
+    else
+        warn "не удалось построить keycloak-clients.map (realm-json не распарсился?)"
+    fi
+}
 
 _umount_lazy() {
     local mp="$1"
@@ -168,7 +321,7 @@ dump_clickhouse() {
     fi
 
     local free_mb
-    free_mb=$(sudo pvs --noheadings -o pv_free --units m "${SNAP_PV}" 2>/dev/null | tr -d ' m<' | cut -d. -f1)
+    free_mb=$(sudo pvs --noheadings -o pv_free --units m "${SNAP_PV}" 2>/dev/null | tr -d ' m<' | cut -d. -f1) || free_mb=""
     [ -n "${free_mb}" ] && [ "${free_mb}" -gt 1024 ] || die "нет свободного места на ${SNAP_PV}"
     log "  снапшот (COW ${free_mb}M)"
     sudo lvcreate -s -n "${SNAP_NAME}" -L "${free_mb}M" "${VG_NAME}/${LV_NAME}" "${SNAP_PV}"
@@ -271,6 +424,19 @@ XMLEOF
     [ "${total}" -gt 0 ] || die "не получен список таблиц"
     log "  таблиц к выгрузке: ${total}"
 
+    # Справочно: движки таблиц. View/MaterializedView/Dictionary выгружаются как
+    # обычные таблицы (SELECT * ... FORMAT Native), и при restore INSERT в них
+    # может не пройти. Если строки ниже не пустые - сверьтесь со штатным архивом.
+    local odd
+    odd=$(sudo docker exec "${CH_TEMP_NAME}" clickhouse-client -q \
+        "SELECT engine || ': ' || toString(count()) FROM system.tables
+         WHERE database='${CH_DB}' AND (engine LIKE '%View' OR engine='Dictionary')
+         GROUP BY engine FORMAT TSVRaw" 2>/dev/null) || odd=""
+    if [ -n "${odd}" ]; then
+        warn "в базе есть представления/словари, они попадут в дамп как обычные таблицы:"
+        printf '%s\n' "${odd}" | while IFS= read -r l; do warn "    ${l}"; done
+    fi
+
     local err_dir
     err_dir=$(mktemp -d)
     export CH_TEMP_NAME CH_DB sql_dir data_dir err_dir
@@ -280,12 +446,14 @@ XMLEOF
         if ! sudo docker exec "${CH_TEMP_NAME}" clickhouse-client -d "${CH_DB}" \
                 -q "SHOW CREATE TABLE \"${table}\"" --format TabSeparatedRaw \
                 > "${sql_dir}/${table}.sql" 2>"${err_dir}/${table}.err"; then
-            rm -f "${sql_dir}/${table}.sql"; return 1
+            rm -f "${sql_dir}/${table}.sql" "${data_dir}/${table}"; return 1
         fi
         if ! sudo docker exec "${CH_TEMP_NAME}" clickhouse-client -d "${CH_DB}" \
                 -q "SELECT * FROM \"${table}\" FORMAT Native" \
                 > "${data_dir}/${table}" 2>>"${err_dir}/${table}.err"; then
-            rm -f "${data_dir}/${table}"; return 1
+            # ВАЖНО: удаляем и .sql тоже, иначе таблица считалась выгруженной,
+            # хотя данных для неё в архиве нет.
+            rm -f "${data_dir}/${table}" "${sql_dir}/${table}.sql"; return 1
         fi
         rm -f "${err_dir}/${table}.err"; return 0
     }
@@ -293,10 +461,20 @@ XMLEOF
 
     xargs -P "${DUMP_PARALLEL}" -I {} bash -c '_dump_one "$@"' _ {} < "${tables_file}" || true
 
-    local done_cnt
+    local done_cnt failed_cnt
     done_cnt=$(find "${sql_dir}" -name '*.sql' | wc -l)
+    failed_cnt=$(find "${err_dir}" -name '*.err' | wc -l)
     log "  выгружено таблиц: ${done_cnt} из ${total}"
-    [ "${done_cnt}" -gt 0 ] || die "не выгружено ни одной таблицы"
+
+    # Раньше проверялось только "выгружена хотя бы одна таблица" - неполный дамп
+    # уезжал в архив как успешный и вскрывался только на restore.
+    if [ "${failed_cnt}" -gt 0 ] || [ "${done_cnt}" -ne "${total}" ]; then
+        warn "не выгружено таблиц: $(( total - done_cnt )), ошибок: ${failed_cnt}"
+        find "${err_dir}" -name '*.err' -printf '%f\n' 2>/dev/null | head -10 \
+            | while IFS= read -r f; do warn "    ${f%.err}"; done
+        rm -rf "${err_dir}" "${tables_file}"
+        die "ClickHouse выгружен не полностью - архив собирать нельзя"
+    fi
 
     rm -rf "${err_dir}" "${tables_file}"
 }
@@ -312,7 +490,7 @@ mkdir -p "${MAIN_BACKUP_DIR}"
 echo "${COMMAND_LINE}" > "${MAIN_BACKUP_DIR}/${COMMAND_FILE}"
 
 log "backup-service: postgres, smartforms (без clickhouse)..."
-container_id=$(docker ps | grep "${PROJECT}_backup-service" | awk '{ print $1 }')
+container_id=$(require_container "${PROJECT}_backup-service" "backup-service")
 docker exec "${container_id}" curl -sLv --request POST --url http://127.0.0.1:8000 \
     --header 'Content-Type: application/json' \
     --data '{"command":"backup","databases":["postgres", "smartforms"],"is_cleanup":true}'
@@ -327,25 +505,56 @@ cp -ra "${ENV_FILES_PATH}"         "${MAIN_BACKUP_DIR}/${ENV_FILES_PATH}"
 cp -ra "${CUSTOM_CONFIGS_PATH}"    "${MAIN_BACKUP_DIR}/${CUSTOM_CONFIGS_PATH}"
 
 log "keycloak..."
-keycloak_container_id=$(docker ps | grep "${PROJECT}_keycloak" | awk '{ print $1 }')
-docker exec -it "${keycloak_container_id}" /opt/keycloak/bin/kc.sh export --file /opt/keycloak/visiology-realm.json --realm "${KEYCLOAK_REALM}" > ${error_output} || true
-docker cp "${keycloak_container_id}":/opt/keycloak/visiology-realm.json "${MAIN_BACKUP_DIR}/visiology-realm.json"
-m2m_secret=$(docker exec -it "${keycloak_container_id}" cat /run/secrets/KEYCLOAK_M2M_SECRET)
-grafana_client_secret=$(docker exec -it "${keycloak_container_id}" cat /run/secrets/KEYCLOAK_GRAFANA_CLIENT_SECRET)
-public_dashboard_access_secret=$(docker exec -it "${keycloak_container_id}" cat /run/secrets/KEYCLOAK_PUBLIC_DASHBOARD_ACCESS_SECRET)
-visiology_admin_realm_secret=$(docker exec -it "${keycloak_container_id}" cat /run/secrets/KEYCLOAK_VISIOLOGY_ADMIN_REALM_SECRET)
+keycloak_container_id=$(require_container "${PROJECT}_keycloak" "keycloak")
+
+# Удаляем прошлый экспорт внутри контейнера: иначе при неудачном kc.sh export
+# (ошибка глушится через || true) в архив уехал бы СТАРЫЙ realm из прошлого прогона.
+docker exec -i "${keycloak_container_id}" rm -f /opt/keycloak/visiology-realm.json 2>/dev/null || true
+docker exec "${keycloak_container_id}" /opt/keycloak/bin/kc.sh export \
+    --file /opt/keycloak/visiology-realm.json --realm "${KEYCLOAK_REALM}" > "${error_output}" 2>&1 || true
+docker exec -i "${keycloak_container_id}" test -s /opt/keycloak/visiology-realm.json \
+    || die "kc.sh export не создал /opt/keycloak/visiology-realm.json (запустите с -d и посмотрите вывод)"
+docker cp "${keycloak_container_id}":/opt/keycloak/visiology-realm.json "${REALM_FILE}"
+grep -q '"realm"' "${REALM_FILE}" || die "visiology-realm.json не похож на экспорт realm"
+
+# Чтение секретов: docker exec -i, БЕЗ -t. Это и есть починка (см. шапку файла).
+m2m_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_M2M_SECRET)
+grafana_client_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_GRAFANA_CLIENT_SECRET)
+public_dashboard_access_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_PUBLIC_DASHBOARD_ACCESS_SECRET)
+visiology_admin_realm_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_VISIOLOGY_ADMIN_REALM_SECRET)
+
+# Болванки. ОБЯЗАНЫ совпадать байт-в-байт с *_old в штатном restore.sh.
 m2m_secret_new="68c96230-43e8-4308-b0ae-65835d8de35e"
 grafana_client_secret_new="749e9d46-1360-4c65-a0a0-82ba3e369b09"
 public_dashboard_access_secret_new="49d410ba-4e0d-4b1a-a064-834f41fb1cfd"
 visiology_admin_realm_secret_new="23e5da38-76e9-47d2-e12c-f0da9f039cc6"
-sed -i "s/${m2m_secret}/${m2m_secret_new}/g" "${MAIN_BACKUP_DIR}/visiology-realm.json"
-sed -i "s/${grafana_client_secret}/${grafana_client_secret_new}/g" "${MAIN_BACKUP_DIR}/visiology-realm.json"
-sed -i "s/${public_dashboard_access_secret}/${public_dashboard_access_secret_new}/g" "${MAIN_BACKUP_DIR}/visiology-realm.json"
-sed -i "s/${visiology_admin_realm_secret}/${visiology_admin_realm_secret_new}/g" "${MAIN_BACKUP_DIR}/visiology-realm.json"
+
+# Карта clientId строится ДО подмены - по реальным значениям секретов.
+write_keycloak_client_map
+
+replace_in_realm "${m2m_secret}"                    "${m2m_secret_new}"                    "KEYCLOAK_M2M_SECRET"
+replace_in_realm "${grafana_client_secret}"         "${grafana_client_secret_new}"         "KEYCLOAK_GRAFANA_CLIENT_SECRET"
+replace_in_realm "${public_dashboard_access_secret}" "${public_dashboard_access_secret_new}" "KEYCLOAK_PUBLIC_DASHBOARD_ACCESS_SECRET"
+replace_in_realm "${visiology_admin_realm_secret}"  "${visiology_admin_realm_secret_new}"  "KEYCLOAK_VISIOLOGY_ADMIN_REALM_SECRET"
+
+# Контроль: в realm-json не должно остаться ни одного секрета исходного стенда.
+for _s in "${m2m_secret}" "${grafana_client_secret}" "${public_dashboard_access_secret}" "${visiology_admin_realm_secret}"; do
+    if grep -qF -- "${_s}" "${REALM_FILE}"; then
+        die "в visiology-realm.json остался секрет исходного стенда - архив непереносим"
+    fi
+done
+unset _s
+# Байт \r внутри JSON-строки Keycloak при импорте не примет (Jackson валит на
+# unquoted control char), а restore.sh глушит ошибку импорта через || true -
+# realm при этом уже удалён. Проверяем явно.
+if LC_ALL=C grep -q $'\r' "${REALM_FILE}"; then
+    die "в visiology-realm.json есть символ \\r - kc.sh import такой файл не примет"
+fi
+log "  realm-json нормализован, секреты стенда в архив не попали"
 
 log "minio..."
 mkdir -p "${MN_FILES_HOST_PATH}"
-minio_container_id=$(docker ps | grep "${PROJECT}_minio" | awk '{ print $1 }')
+minio_container_id=$(require_container "${PROJECT}_minio" "minio")
 if docker exec "${minio_container_id}" test -d "${MN_FILES_CONTAINER_PATH}/dev"; then
     docker cp "${minio_container_id}":${MN_FILES_CONTAINER_PATH}/dev "${MN_FILES_HOST_PATH}"
 fi
@@ -357,25 +566,28 @@ log "секреты..."
 mkdir -p "${SECRETS_FILES_HOST_PATH}"
 
 # dm-secret (DATA_MANAGEMENT_SECRET_KEY)
-dms_container_id=$(docker ps | grep "${PROJECT}_data-management-service" | awk '{ print $1 }')
+dms_container_id=$(resolve_container "${PROJECT}_data-management-service") || true
 if [ -n "${dms_container_id}" ]; then
-    docker exec -i "${dms_container_id}" sh -c 'cat /run/secrets/DATA_MANAGEMENT_SECRET_KEY; echo -n ""' >> "${SECRETS_FILES_HOST_PATH}/dm-secret.txt"
+    copy_secret_file "${dms_container_id}" DATA_MANAGEMENT_SECRET_KEY "${SECRETS_FILES_HOST_PATH}/dm-secret.txt"
+    log "  dm-secret сохранён"
 else
     log "  ! data-management-service не найден, dm-secret пропущен"
 fi
 
 # ai-secret (AI_API_KEY)
-ai_agent_container_id=$(docker ps | grep "${PROJECT}_ai-agent" | awk '{ print $1 }')
+ai_agent_container_id=$(resolve_container "${PROJECT}_ai-agent") || true
 if [ -n "${ai_agent_container_id}" ]; then
-    docker exec -i "${ai_agent_container_id}" sh -c 'cat /run/secrets/AI_API_KEY; echo -n ""' >> "${SECRETS_FILES_HOST_PATH}/ai-secret.txt"
+    copy_secret_file "${ai_agent_container_id}" AI_API_KEY "${SECRETS_FILES_HOST_PATH}/ai-secret.txt"
+    log "  ai-secret сохранён"
 else
     log "  ! ai-agent не найден, ai-secret пропущен"
 fi
 
 # onec-secret (ONEC_CONNECTOR_FERNET)
-onec_container_id=$(docker ps | grep "${PROJECT}_onec-connector.1" | awk '{ print $1 }')
+onec_container_id=$(resolve_container "${PROJECT}_onec-connector.1") || true
 if [ -n "${onec_container_id}" ]; then
-    docker exec -i "${onec_container_id}" sh -c 'cat /run/secrets/ONEC_CONNECTOR_FERNET; echo -n ""' >> "${SECRETS_FILES_HOST_PATH}/onec-secret.txt"
+    copy_secret_file "${onec_container_id}" ONEC_CONNECTOR_FERNET "${SECRETS_FILES_HOST_PATH}/onec-secret.txt"
+    log "  onec-secret сохранён"
 else
     log "  ! onec-connector не найден, onec-secret пропущен"
 fi
@@ -386,6 +598,12 @@ archive_name="$(hostname)-backup-v${VERSION}-$(date '+%Y-%m-%d-%H-%M-%S').tar.gz
 backup_file_dir=$(dirname "$(readlink -f "${BACKUP_DIR}/${archive_name}")")
 log "упаковка (${COMPRESSOR%% *})..."
 sudo tar -cf - -C "${backup_file_dir}" backup | ${COMPRESSOR} > "${backup_file_dir}/${archive_name}"
+[ -s "${backup_file_dir}/${archive_name}" ] || die "архив не создан или пустой"
+
+if [ -f "${KC_WARN_FILE}" ]; then
+    warn "секреты Keycloak НЕ нормализованы - после restore обязательно выполните:"
+    warn "    ./visiology-keycloak-sync.sh"
+fi
 
 t_end=$(date +%s)
 elapsed=$(( (t_end - t_start) / 60 ))
