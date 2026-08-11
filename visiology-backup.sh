@@ -342,17 +342,20 @@ _snapshot_holders() {
     sudo dmsetup info -c 2>/dev/null | grep -i "${SNAP_NAME}" | while IFS= read -r l; do log "      ${l}"; done || true
 }
 
+# $1 - сколько попыток (по 3 секунды). Ранний снос делается коротким: если
+# снапшот занят, ждать перед выгрузкой бессмысленно - всё равно идём дальше.
+# Настойчивые попытки оставлены на конец, где ожидание никого не задерживает.
 _remove_snapshot() {
     sudo lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1 || return 0
-    local i
-    for i in $(seq 1 40); do
+    local attempts="${1:-40}" i
+    for i in $(seq 1 "${attempts}"); do
         if sudo lvremove -y "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
             [ "${i}" -gt 1 ] && log "  снапшот удалён с попытки ${i}"
             return 0
         fi
-        # на пятой попытке показываем, кто держит - обычно это антивирус
-        [ "${i}" = "5" ] && _snapshot_holders
-        [ "${i}" = "20" ] && log "  снапшот всё ещё занят, продолжаю попытки..."
+        # показываем держателя один раз, если попыток много (не в раннем сносе)
+        if [ "${i}" = "5" ]; then _snapshot_holders; fi
+        if [ "${i}" = "20" ]; then log "  снапшот всё ещё занят, продолжаю попытки..."; fi
         sudo lvchange -an "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1 || true
         sleep 3
     done
@@ -650,7 +653,7 @@ dump_clickhouse() {
     log "  удаляю снапшот"
     _umount_lazy "${SNAP_MNT}"
     SNAP_MOUNTED=0
-    if _remove_snapshot; then
+    if _remove_snapshot 3; then
         SNAP_CREATED=0
         log "  снапшот удалён, COW освобождён"
     else
@@ -659,9 +662,9 @@ dump_clickhouse() {
         # пока он жив, каждая запись в корень платит copy-on-write - боевая
         # система пишет медленнее. Поэтому пробуем ещё раз после выгрузки и
         # в самом конце через trap.
-        warn "снапшот пока не удалён (обычно его держит антивирус на ${SNAP_MNT})."
+        warn "снапшот занят, не жду (обычно его держит антивирус на ${SNAP_MNT})."
         warn "  На данные это не влияет: выгрузка идёт с копии в ${CH_COPY_DIR}."
-        warn "  Пока снапшот жив, записи в корень идут медленнее. Повторю позже."
+        warn "  Пока снапшот жив, записи в корень идут медленнее. Повторю после выгрузки."
         _snapshot_holders
     fi
 
