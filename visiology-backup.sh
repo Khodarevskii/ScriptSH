@@ -1,47 +1,26 @@
 #!/bin/bash -e
 #
-# visiology-backup.sh
+# visiology-backup.sh - полный бэкап платформы Visiology (Docker Swarm).
 #
-# Свой оркестратор полного бэкапа Visiology с консистентным ClickHouse.
-# Собирает всё в одну папку backup/ и пакует ОДИН раз (без перепаковки).
+# Postgres, Smart Forms, MinIO, Keycloak, docker secrets и пользовательские
+# настройки снимаются теми же командами, что и штатный backup.sh. ClickHouse
+# снимается отдельно: LVM-снапшот корня, копия каталога данных, временный
+# сервер CH на этой копии и выгрузка в формате Native. Это даёт согласованный
+# срез базы без остановки платформы.
 #
-# Не-CH части (postgres, smartforms, minio, keycloak, секреты, custom) делаются
-# ТЕМИ ЖЕ командами, что штатный backup.sh. ClickHouse снимается своей логикой:
-# LVM-снапшот корня (ro) -> копия данных CH в отдельный каталог -> временный CH
-# на копии -> параллельная выгрузка в штатный формат Native.
-# Точка монтирования отцепляется сразу после копирования, но В ФОНЕ - umount на
-# снапшоте, который держит антивирус, уходит в непрерываемый сон, и timeout его
-# не убивает. Сам снапшот живёт до конца прогона, его вместе с копией и
-# временными контейнерами убирает cleanup - уже ПОСЛЕ сборки архива.
+# Скрипт размещается рядом со штатным backup.sh: ему нужны config.env,
+# defaults.env и относительные каталоги extended-services, env-files,
+# custom-configs.
 #
-# Кладётся В ТУ ЖЕ ПАПКУ, что штатный backup.sh (нужны config.env/defaults.env
-# и относительные пути extended-services/env-files/custom-configs).
+# Результат - один архив <hostname>-backup-v<версия>-<дата>.tar.gz.
+# Коды возврата: 0 - успех, 1 - ошибка, 3 - прогон уже выполняется.
 #
-# ЭТАПЫ:
-#   1. backup-service без clickhouse (postgres, smartforms)
-#   2. custom scripts / extended / env / configs
-#   3. keycloak (export + подмена секретов)
-#   4. minio, секреты
-#   5. ClickHouse через LVM-снапшот -> Native-выгрузка
-#   6. tar один раз -> финальный архив
-#
-# ------------------------------------------------------------------------------
-# ВАЖНО ПРО KEYCLOAK (причина, по которой прошлые архивы не поднимались):
-# секреты из /run/secrets ЧИТАЮТСЯ ТОЛЬКО ЧЕРЕЗ `docker exec -i` (без -t).
-# С флагом -t docker выделяет псевдотерминал, tty-дисциплина превращает \n в \r\n,
-# и в переменную попадает хвостовой \r. Такой шаблон sed не находит в realm-json ->
-# подмена на болванку молча не срабатывает -> в архиве остаются секреты ИСХОДНОГО
-# стенда -> restore.sh не находит болванок, не подставляет секреты целевого стенда ->
-# invalid_client_credentials. Подробности и порядок лечения: ИСПРАВЛЕНИЯ.md
-# ------------------------------------------------------------------------------
-
-# Версия платформы (определяется после source config.env - см. ниже).
 COMMAND_LINE="$0 $*"
 error_output=/dev/null
 
-# Оставить в realm-json секреты этого стенда, не подменяя их на болванки
+# Оставить в realm-json секреты этого стенда, не подменяя их на заглушки
 KC_KEEP_SECRETS=0
-# Ноды ClickHouse: разрешить неполный дамп и выгрузка одной конкретной ноды
+# Разрешить неполный дамп ClickHouse и выгрузку одной конкретной ноды
 ALLOW_PARTIAL_CH=0
 CH_ONLY_NODE=""
 CH_ONLY=0
@@ -75,12 +54,10 @@ while [ "$1" != "" ]; do
             echo "                со списком того, что не попало."
             echo
             echo "  --keep-keycloak-secrets"
-            echo "                не подменять секреты в realm-json на болванки."
-            echo "                По умолчанию скрипт решает это сам: если чтение"
-            echo "                секрета через tty добавляет \\r, штатный restore.sh"
-            echo "                испортит JSON при обратной подстановке, и подмена"
-            echo "                пропускается. Секреты в любом случае синхронизируются"
-            echo "                вручную после восстановления."
+            echo "                не подменять секреты клиентов в realm-json на"
+            echo "                заглушки. В архив попадут секреты этого стенда,"
+            echo "                и после восстановления их потребуется"
+            echo "                синхронизировать вручную."
             echo
             echo "Полный бэкап Visiology (postgres, smartforms, minio, keycloak,"
             echo "секреты, custom) + консистентный ClickHouse через LVM-снапшот."
@@ -116,18 +93,14 @@ while [ "$1" != "" ]; do
     shift
 done
 
-# Ошибка в любом звене конвейера должна валить шаг, а не проглатываться.
+# Ошибка в любом звене конвейера считается ошибкой шага.
 set -o pipefail
 
-# ЗАПУСК ИЗ CRON.
-# У cron минимальный PATH (обычно /usr/bin:/bin), а lvs/lvcreate/lvremove живут
-# в /usr/sbin. Все вызовы LVM идут через sudo и покрываются его secure_path, но
-# полагаться на это не стоит - задаём PATH явно.
+# PATH задаётся явно: у cron он минимальный, а утилиты LVM лежат в /usr/sbin.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-# Блокировка. Полный бэкап идёт часами; если следующий запуск по расписанию
-# наложится на предыдущий, получим две попытки создать одноимённый снапшот и
-# два временных ClickHouse. Второй запуск просто выходит с кодом 3.
+# Защита от параллельных запусков: прогон длится часами, и наложение расписания
+# привело бы к попытке создать снапшот с уже занятым именем.
 LOCK_DIR=/var/lock
 [ -w "${LOCK_DIR}" ] || LOCK_DIR=/tmp
 LOCK_FILE="${LOCK_DIR}/visiology-backup.lock"
@@ -158,12 +131,9 @@ SNAP_PV="/dev/sdg"
 CH_IMAGE="cr.yandex/crpe1mi33uplrq7coc9d/visiology/release/original/clickhouse-server:24.8.11.51285-alpine"
 CH_DB="visiology"
 CH_TEMP_NAME="ch_temp_backup"     # префикс имени временных контейнеров
-CH_TEMP_PORT="9001"
 
-# Резерв на случай, если ни backup-service, ни Swarm опросить не удалось.
-# В норме имя каталога берётся из CLICKHOUSE_HOSTS у backup-service (именно его
-# ждёт restore), а имя тома - из спецификации сервиса. При горизонтальном
-# масштабировании хостов CH становится несколько.
+# Резервные значения на случай, если ни backup-service, ни Swarm опросить не
+# удалось. В норме имя каталога и имя тома определяются автоматически.
 CH_HOST_LABEL="clickhouse-1"
 CH_VOLUME="visiology3_clickhouse_data"
 CH_CPUS="4"
@@ -211,9 +181,10 @@ CH_COPY_CREATED=0
 # Общие помощники
 ########################################
 
-# Поиск контейнера по подстроке имени. Через docker ps --filter, а не
-# `docker ps | grep`: grep ловит совпадения и в колонке IMAGE, а при нескольких
-# совпавших строках awk вернёт несколько ID через пробел и docker exec сломается.
+# Поиск контейнера по подстроке имени.
+# Используется фильтр docker ps, а не grep по его выводу: grep совпадает в том
+# числе по колонке IMAGE и при нескольких совпадениях возвращает несколько
+# идентификаторов.
 resolve_container() {
     docker ps --filter "name=$1" --format '{{.ID}}' | head -1
 }
@@ -226,9 +197,10 @@ require_container() {
     printf '%s' "${cid}"
 }
 
-# Чтение ЗНАЧЕНИЯ секрета для подстановки в sed.
-# ТОЛЬКО -i, без -t (см. блок ВАЖНО ПРО KEYCLOAK в шапке).
-# tr -d '\r\n' - страховка на случай, если сам файл секрета создан с переводом строки.
+
+# Значение секрета для подстановки в realm-json.
+# Только -i, без -t: с псевдотерминалом docker добавляет к выводу \r.
+# tr -d дополнительно нормализует файл секрета, созданный с переводом строки.
 read_secret_value() {
     local cid="$1" name="$2" val
     val=$(docker exec -i "${cid}" cat "/run/secrets/${name}" 2>/dev/null | tr -d '\r\n') || true
@@ -236,12 +208,9 @@ read_secret_value() {
     printf '%s' "${val}"
 }
 
-# Копирование секрета В ФАЙЛ архива - байт-в-байт, БЕЗ нормализации.
-# Здесь \r\n убирать НЕЛЬЗЯ: restore.sh отдаёт этот файл в `docker secret create`,
-# и секрет должен восстановиться ровно тем же набором байт, иначе Fernet-ключи
-# (DATA_MANAGEMENT_SECRET_KEY, ONEC_CONNECTOR_FERNET) перестанут расшифровывать данные.
-# Отличие от штатного скрипта: '>' вместо '>>' (append при повторном прогоне
-# склеивал два ключа в один файл) и проверка, что файл не пустой.
+
+# Файл секрета для архива - побайтово, без нормализации: restore.sh передаёт его
+# в docker secret create, и значение должно восстановиться без изменений.
 copy_secret_file() {
     local cid="$1" name="$2" out="$3"
     docker exec -i "${cid}" cat "/run/secrets/${name}" > "${out}" \
@@ -253,11 +222,10 @@ copy_secret_file() {
 _esc_bre()  { printf '%s' "$1" | sed 's@[][\\.*^$/]@\\&@g'; }
 _esc_repl() { printf '%s' "$1" | sed 's@[\\&/]@\\&@g'; }
 
-# Подмена секрета в realm-json с проверкой ДО и ПОСЛЕ.
-# Отсутствие этих проверок и делало поломку невидимой: sed возвращает 0,
-# даже когда не нашёл ни одного совпадения.
-# Бэкап из-за секретов НЕ прерывается: расхождения отмечаются в KC_WARN_FILE
-# и правятся вручную после восстановления.
+# Подмена секрета в realm-json на значение-заглушку с проверкой до и после.
+# sed возвращает 0 и тогда, когда не нашёл ни одного совпадения, поэтому
+# результат проверяется явно. Расхождения не прерывают бэкап: они записываются
+# в KC_WARN_FILE и устраняются вручную после восстановления.
 replace_in_realm() {
     local old="$1" new="$2" label="$3"
 
@@ -283,10 +251,10 @@ replace_in_realm() {
     log "  ${label}: подменён на болванку"
 }
 
-# Карта "имя docker secret -> clientId" по фактическим значениям секретов.
-# Кладётся в архив и позволяет после restore точечно синхронизировать секреты
-# (visiology-keycloak-sync.sh), не угадывая clientId руками.
-# Секреты передаются в python ТОЛЬКО через stdin - в argv/ps они не светятся.
+# Соответствие "имя docker secret -> clientId". Определяется по фактическим
+# значениям секретов и кладётся в архив: после восстановления оно позволяет
+# синхронизировать секреты, не подбирая clientId вручную.
+# Значения передаются в python через stdin и не попадают в argv.
 write_keycloak_client_map() {
     command -v python3 >/dev/null 2>&1 || { warn "python3 не найден, keycloak-clients.map не создан"; return 0; }
     local py; py=$(mktemp)
@@ -335,21 +303,21 @@ _umount_lazy() {
         if sudo timeout 30 umount "${mp}" >/dev/null 2>&1; then return 0; fi
         sleep 2
     done
-    # Ленивое размонтирование отцепляет ФС сразу, даже если она занята, и почти
-    # никогда не блокируется. Пробуем ЕГО, а не fuser - именно на fuser скрипт и вис.
+    # Ленивое размонтирование отцепляет файловую систему даже если она занята
+    # и, в отличие от fuser, практически не блокируется.
     if sudo umount -l "${mp}" >/dev/null 2>&1; then
         sleep 1
         timeout 10 mountpoint -q "${mp}" 2>/dev/null || return 0
     fi
-    # Последнее средство. fuser обходит весь /proc и на занятой точке умеет висеть
-    # минутами (тут ещё и k8s рядом), поэтому под timeout. -k шлёт SIGKILL держателям.
+    # Последнее средство: fuser обходит /proc целиком и на занятой точке может
+    # выполняться минутами, поэтому ограничен по времени. -k шлёт SIGKILL.
     sudo timeout 20 fuser -km "${mp}" >/dev/null 2>&1 || true
     sleep 1
     sudo timeout 30 umount -l "${mp}" >/dev/null 2>&1 || true
 }
 
-# Кто держит снапшот. Нужно, чтобы в логе было видно антивирус (kesl) или
-# другой процесс, а не просто "не удалось удалить".
+# Процессы, удерживающие снапшот. Выводятся в лог, чтобы причина неудачного
+# удаления была видна (как правило это антивирус).
 _snapshot_holders() {
     local dev="/dev/${VG_NAME}/${SNAP_NAME}"
     log "  кто держит ${SNAP_MNT} / ${dev}:"
@@ -363,9 +331,7 @@ _snapshot_holders() {
     sudo dmsetup info -c 2>/dev/null | grep -i "${SNAP_NAME}" | while IFS= read -r l; do log "      ${l}"; done || true
 }
 
-# $1 - сколько попыток (по 3 секунды). Ранний снос делается коротким: если
-# снапшот занят, ждать перед выгрузкой бессмысленно - всё равно идём дальше.
-# Настойчивые попытки оставлены на конец, где ожидание никого не задерживает.
+# Удаление снапшота. $1 - число попыток с интервалом 3 секунды.
 _remove_snapshot() {
     sudo timeout 15 lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1 || return 0
     local attempts="${1:-40}" i
@@ -374,12 +340,11 @@ _remove_snapshot() {
             [ "${i}" -gt 1 ] && log "  снапшот удалён с попытки ${i}"
             return 0
         fi
-        # показываем держателя один раз, если попыток много (не в раннем сносе)
+        # держатели показываются один раз
         if [ "${i}" = "5" ]; then _snapshot_holders; fi
-        # Ленивое размонтирование отцепляет только ИМЯ: ФС внутри ядра живёт,
-        # пока держатель (обычно антивирус) не закроет дескрипторы, и всё это
-        # время LV занят. Точки монтирования уже нет, поэтому освобождаем по
-        # устройству. timeout - чтобы fuser не встал намертво.
+        # Ленивое размонтирование отцепляет только имя: файловая система живёт,
+        # пока держатель не закроет дескрипторы, и всё это время том занят.
+        # Точки монтирования уже нет, поэтому держатели освобождаются по устройству.
         if [ "${i}" = "10" ] || [ "${i}" = "25" ]; then
             log "  снапшот занят, освобождаю держателей по устройству"
             sudo timeout 20 fuser -km "/dev/${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1 || true
@@ -392,10 +357,9 @@ _remove_snapshot() {
     return 1
 }
 
-# Снос временных контейнеров CH (их может быть несколько - по одному на ноду).
-# ВАЖНО: конвейер обёрнут в $( ... || true). При set -o pipefail пустой вывод
-# grep возвращает 1, и голый конвейер под `set -e` обрывал бы весь скрипт -
-# именно на этом первый прогон и остановился.
+# Удаление временных контейнеров CH (по одному на ноду).
+# Конвейер обёрнут в $( ... || true): при pipefail пустой вывод grep возвращает
+# 1, и голый конвейер под set -e прервал бы скрипт.
 _rm_temp_ch_containers() {
     local names n
     names=$(sudo docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${CH_TEMP_NAME}" || true)
@@ -408,11 +372,9 @@ cleanup() {
     local rc=$?
     log "очистка..."
 
-    # ПОРЯДОК ВАЖЕН. Сначала то, что выполняется быстро и освобождает место:
-    # копия данных CH занимает столько же, сколько сама база (на стенде 16 ГБ),
-    # и корень без неё дышит свободнее. Возня со снапшотом идёт последней,
-    # потому что она единственная может подвиснуть, и терять из-за неё
-    # освобождение диска нельзя.
+    # Порядок важен: сначала быстрые операции, освобождающие место (копия данных
+    # CH сопоставима по объёму с самой базой), затем снапшот - единственный шаг,
+    # способный подвиснуть.
     _rm_temp_ch_containers
     sudo rm -rf /tmp/vis_ch_conf >/dev/null 2>&1 || true
     if [ "${CH_COPY_CREATED}" = "1" ] || [ -d "${CH_COPY_DIR}" ]; then
@@ -420,13 +382,12 @@ cleanup() {
         sudo rm -rf "${CH_COPY_DIR}" >/dev/null 2>&1 || true
     fi
 
-    # Дальше - снапшот. Здесь возможно зависание: umount на снапшоте, который
-    # держит антивирус, уходит в непрерываемый сон, и timeout его не убивает.
-    # Поэтому команды для ручной уборки печатаем ДО попытки, а не после -
-    # чтобы они остались на экране, даже если придётся прервать по Ctrl+C.
+    # Снапшот удаляется последним. umount на снапшоте, удерживаемом антивирусом,
+    # может уйти в непрерываемый сон, где ограничение по времени не работает,
+    # поэтому команды ручной уборки выводятся до попытки, а не после.
     if [ "${SNAP_CREATED}" = "1" ] || sudo timeout 15 lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
-        log "  убираю снапшот. Если подвиснет - архив уже собран, Ctrl+C безопасен,"
-        log "  а снапшот потом снимается вручную:"
+        log "  удаляю снапшот. Архив к этому моменту уже собран; при зависании"
+        log "  снапшот снимается вручную:"
         log "    sudo umount -l ${SNAP_MNT}; sudo lvremove -y ${VG_NAME}/${SNAP_NAME}"
 
         if [ "${SNAP_MOUNTED}" = "1" ] || timeout 10 mountpoint -q "${SNAP_MNT}" 2>/dev/null; then
@@ -452,13 +413,12 @@ cleanup() {
 trap 'trap "" INT TERM; cleanup' EXIT
 trap 'exit 130' INT TERM
 
-# Ноды ClickHouse. Источник истины - переменная CLICKHOUSE_HOSTS у backup-service:
-# именно её значения штатный дамп использует как ИМЕНА КАТАЛОГОВ
-#   Backuper.py:  backup_dir = join(self.config.backup_dir, host)
-#   Config.py:    CLICKHOUSE_HOSTS = os.getenv('CLICKHOUSE_HOSTS','').split()
-# То есть "clickhouse-1" в архиве - это сетевое имя хоста CH, а не порядковый
-# номер. Имя тома и хост, где нода реально работает, спрашиваем у Swarm.
-# Формат строки: <хост CH>|<сервис>|<том>|<хост Swarm>
+# Ноды ClickHouse.
+# Имена каталогов в архиве равны значениям CLICKHOUSE_HOSTS сервиса
+# backup-service: штатный код формирует путь как <каталог>/<host>, поэтому
+# "clickhouse-1" - сетевое имя хоста, а не порядковый номер ноды.
+# Имя тома и узел Swarm, где нода работает, запрашиваются у Docker.
+# Формат строки: <хост CH>|<сервис>|<том>|<узел Swarm>
 detect_ch_nodes() {
     local bs hosts h svc vol node
     bs=$(docker ps --filter "name=${PROJECT}_backup-service" --format '{{.ID}}' 2>/dev/null | head -1) || bs=""
@@ -468,9 +428,8 @@ detect_ch_nodes() {
         hosts=""
     fi
     if [ -z "${hosts}" ]; then
-        # Резерв: перечисляем сервисы CH сами. Имена каталогов при этом совпадут
-        # с именами сервисов, что верно для штатной установки, но проверить
-        # CLICKHOUSE_HOSTS всё равно стоит.
+        # Резервный путь: перечисление сервисов CH. Имена каталогов совпадут с
+        # именами сервисов, что верно для штатной установки.
         hosts=$(docker service ls --format '{{.Name}}' 2>/dev/null \
                  | grep -E "^${PROJECT}_clickhouse" \
                  | grep -viE 'jdbc|bridge|keeper|zookeeper' \
@@ -485,14 +444,13 @@ detect_ch_nodes() {
     done
 }
 
-# Выгрузка ОДНОЙ ноды CH с уже готовой копии данных.
-#   $1 - имя хоста CH (оно же имя каталога в архиве), $2 - каталог с копией
-#
-# Поведение повторяет штатный Backuper.ClickhouseBackup._backup:
-# SHOW TABLES -> отсев jemalloc и cache_queries_ -> на каждую таблицу
-# SHOW CREATE TABLE в sql/<таблица>.sql и SELECT * FORMAT Native в data/<таблица>.
-# Данные выгружаются для ВСЕХ объектов, включая представления и словари -
-# штатный дамп исключений не делает.
+# Выгрузка одной ноды CH с готовой копии данных.
+#   $1 - имя хоста CH, оно же имя каталога в архиве
+#   $2 - каталог с копией данных
+# Повторяет поведение штатного дампа: SHOW TABLES с отсевом jemalloc и
+# cache_queries_, затем на каждый объект SHOW CREATE TABLE в sql/<имя>.sql и
+# SELECT * FORMAT Native в data/<имя>. Исключений для представлений и словарей
+# штатный дамп не делает.
 _dump_ch_node() {
     local host="$1" copy_dir="$2"
     local cname="${CH_TEMP_NAME}_$(printf '%s' "${host}" | tr -c 'A-Za-z0-9_.-' '_')"
@@ -506,7 +464,6 @@ _dump_ch_node() {
         --cpus="${CH_CPUS}" --memory="${CH_MEMORY}" --cpu-shares="${CH_CPU_SHARES}" \
         -v "${copy_dir}:/var/lib/clickhouse" \
         -v "${ch_conf_dir}/zz-backup-quiet.xml:/etc/clickhouse-server/config.d/zz-backup-quiet.xml:ro" \
-        -p "${CH_TEMP_PORT}:9000" \
         --ulimit nofile=262144:262144 \
         -e CLICKHOUSE_SKIP_USER_SETUP=1 \
         "${CH_IMAGE}" >/dev/null
@@ -561,9 +518,8 @@ _dump_ch_node() {
         if ! sudo docker exec "${cname}" clickhouse-client -d "${CH_DB}" \
                 -q "SELECT * FROM \"${table}\" FORMAT Native" \
                 > "${data_dir}/${table}" 2>>"${err_dir}/${table}.err"; then
-            # ВАЖНО: удаляем и .sql тоже, иначе таблица считалась бы выгруженной,
-            # хотя данных для неё в архиве нет. Штатный дамп в этом месте оставляет
-            # осиротевший .sql - у нас так быть не должно, см. ИСПРАВЛЕНИЯ.md.
+            # .sql удаляется вместе с данными: иначе объект считался бы
+            # выгруженным при отсутствующем файле данных.
             rm -f "${data_dir}/${table}" "${sql_dir}/${table}.sql"; return 1
         fi
         rm -f "${err_dir}/${table}.err"; return 0
@@ -572,8 +528,8 @@ _dump_ch_node() {
 
     xargs -P "${DUMP_PARALLEL}" -I {} bash -c '_dump_one "$@"' _ {} < "${tables_file}" || true
 
-    # Точка с запятой в имени таблицы ломает разбор имени в штатном restore
-    # (Backuper.py: table.split(os.path.sep)[-1].split('.')[0] режет по ПЕРВОЙ точке).
+    # Штатный restore определяет имя таблицы как <файл>.split('.')[0], то есть
+    # обрезает его по первой точке.
     local dotted
     dotted=$(grep -c '\.' "${tables_file}") || dotted=0
     [ "${dotted}" -eq 0 ] || warn "${host}: таблиц с точкой в имени: ${dotted} - штатный restore восстановит их под усечённым именем"
@@ -584,17 +540,16 @@ _dump_ch_node() {
     failed_cnt=$(find "${err_dir}" -type f -name '*.err' | wc -l)
     log "  ${host}: sql ${done_sql}, data ${done_data}, ожидалось по ${total}"
 
-    # Мы выгружаем с ЗАМОРОЖЕННОЙ копии, таблицы исчезать не могут - в отличие от
-    # штатного дампа с живой базы. Поэтому любое расхождение здесь - реальная
-    # ошибка, а не гонка, и архив собирать нельзя.
+    # Выгрузка идёт с замороженной копии, где таблицы не могут исчезнуть, в
+    # отличие от штатного дампа с работающей базы. Любое расхождение здесь -
+    # ошибка, а не гонка.
     if [ "${failed_cnt}" -gt 0 ] || [ "${done_sql}" -ne "${total}" ] || [ "${done_data}" -ne "${total}" ]; then
         warn "${host}: схем не хватает $(( total - done_sql )), данных $(( total - done_data )), ошибок: ${failed_cnt}"
         warn "${host}: не выгрузились (первые 20):"
         find "${err_dir}" -type f -name '*.err' -printf '%f\n' 2>/dev/null | head -20 \
             | while IFS= read -r f; do warn "    ${f%.err}"; done
-        # Типичные причины: словари (нет доступа к их источникам с временного CH)
-        # и Distributed-таблицы (в временный контейнер не монтируется
-        # clickhousecluster.xml). Штатный дамп такие объекты молча пропускает.
+        # Типичные причины: словари, для которых у временного сервера нет доступа
+        # к источникам, и Distributed-таблицы, требующие конфигурации кластера.
         if [ "${ALLOW_PARTIAL_CH}" = "1" ]; then
             {
                 echo "${host}: выгружено схем ${done_sql}, данных ${done_data} из ${total}"
@@ -678,12 +633,10 @@ dump_clickhouse() {
     sudo mount -o ro "/dev/${VG_NAME}/${SNAP_NAME}" "${SNAP_MNT}"
     SNAP_MOUNTED=1
 
-    # Копируем данные CH из снапшота, затем снапшот сразу удаляем.
-    # Снапшот живёт только на время cp (минуты) - COW не успевает переполниться
-    # от записи боевой системы в корень. Выгрузка идёт с копии.
-    # Снапшот один на все локальные ноды: срез получается одномоментным сразу
-    # для всех шардов. Место под копии нужно суммарно по всем локальным нодам,
-    # каждая копия удаляется сразу после выгрузки своей ноды.
+    # Копия данных снимается со снапшота, дальнейшая выгрузка работает с ней.
+    # Снапшот один на все локальные ноды, поэтому срез одномоментен для всех
+    # шардов. Копия каждой ноды удаляется сразу после её выгрузки, чтобы не
+    # требовать места под все ноды одновременно.
     log "  копирую данные CH..."
     sudo rm -rf "${CH_COPY_DIR}"
     sudo mkdir -p "${CH_COPY_DIR}"
@@ -697,34 +650,16 @@ dump_clickhouse() {
         log "  ${chost}: копия готова ($(sudo du -sh "${CH_COPY_DIR}/${chost}" 2>/dev/null | cut -f1))"
     done
 
-    # Снапшот и точку монтирования здесь НЕ трогаем.
-    #
-    # Так было не всегда: раньше тут стояло размонтирование и одна попытка
-    # lvremove. На практике umount на снапшоте, который держит антивирус,
-    # уходит в непрерываемый сон (D-state), а timeout такой процесс убить не
-    # может и ждёт его вместе со всеми - прогон вставал на 17 минут и требовал
-    # Ctrl+C. Поэтому вся уборка перенесена в cleanup, в самый конец: там она
-    # выполняется уже ПОСЛЕ того, как архив собран и его имя напечатано, и
-    # зависание никому не мешает.
-    #
-    # Плата: пока снапшот жив, каждая запись в корень выполняет copy-on-write,
-    # то есть система пишет медленнее всё время выгрузки. Данным это не грозит -
-    # выгрузка идёт с копии, а переполнение COW лишь пометит снапшот invalid.
-    # Точку монтирования отцепляем сразу, но В ФОНЕ и не дожидаясь результата.
-    # Зачем отцеплять: отмонтированный снапшот потом сносится обычным lvremove
-    # в любой момент, а переполнившийся ПРИМОНТИРОВАННЫМ отдирать тяжело -
-    # файловая система на нём уходит в ошибки.
-    # Почему в фоне: umount на снапшоте, который держит антивирус, уходит в
-    # непрерываемый сон, и timeout такой процесс убить не может (проверено -
-    # прогон вставал на 17 минут). В фоне это никому не мешает: данные уже
-    # скопированы, выгрузка идёт с копии, точка монтирования больше не нужна.
-    # Сам снапшот (LV) сносит cleanup в самом конце.
-    log "  отцепляю ${SNAP_MNT} в фоне, не жду; снапшот снесём в конце прогона"
+    # Точка монтирования больше не нужна и отцепляется сразу, но в фоне: umount
+    # на снапшоте, удерживаемом антивирусом, может уйти в непрерываемый сон, где
+    # ограничение по времени не работает. Обработчики внутри подшелла сброшены,
+    # иначе cleanup выполнился бы в фоне. Сам снапшот удаляет cleanup в конце.
+    log "  отцепляю ${SNAP_MNT} в фоне; снапшот удаляется в конце прогона"
     ( trap - EXIT INT TERM; _umount_lazy "${SNAP_MNT}" ) >/dev/null 2>&1 &
     disown 2>/dev/null || true
 
-    # Глушащий конфиг: отключаем системные лог-таблицы (чтобы CH не тратил
-    # ресурсы и не раздувал копию логами при работе).
+    # Системные лог-таблицы отключаются, чтобы временный сервер не расходовал
+    # ресурсы и не увеличивал копию данных.
     local ch_conf_dir="/tmp/vis_ch_conf"
     sudo rm -rf "${ch_conf_dir}"
     sudo mkdir -p "${ch_conf_dir}"
@@ -773,8 +708,8 @@ XMLEOF
      Скрипт снимает LVM-снапшот ЛОКАЛЬНОГО корня и чужие ноды снять не может.
      Данные CH шардированы: архив без них будет неполным, а выглядеть будет успешным.
      Варианты:
-       1) запустить скрипт на каждом хосте с --ch-node <номер> и объединить
-          каталоги backup/clickhouse/clickhouse-<N> в один архив;
+       1) запустить скрипт на каждом хосте с --ch-only --ch-node <имя> и
+          объединить каталоги backup/clickhouse/<имя> в один архив;
        2) осознанно собрать неполный архив: $0 --allow-partial-clickhouse"
         fi
     fi
@@ -787,8 +722,8 @@ t_start=$(date +%s)
 log "=== СТАРТ полного бэкапа Visiology ==="
 
 if [ "${CH_ONLY}" = "1" ]; then
-    # Режим дополнительного хоста CH: каталог backup/ не трогаем и ничего,
-    # кроме ClickHouse, не собираем - на этом хосте остальных сервисов нет.
+    # Режим дополнительного хоста CH: каталог backup/ не очищается, собирается
+    # только ClickHouse - остальных сервисов на таком хосте нет.
     log "режим --ch-only: только ClickHouse"
     mkdir -p "${MAIN_BACKUP_DIR}"
 else
@@ -815,8 +750,8 @@ cp -ra "${CUSTOM_CONFIGS_PATH}"    "${MAIN_BACKUP_DIR}/${CUSTOM_CONFIGS_PATH}"
 log "keycloak..."
 keycloak_container_id=$(require_container "${PROJECT}_keycloak" "keycloak")
 
-# Удаляем прошлый экспорт внутри контейнера: иначе при неудачном kc.sh export
-# (ошибка глушится через || true) в архив уехал бы СТАРЫЙ realm из прошлого прогона.
+# Прошлый экспорт удаляется заранее: ошибка kc.sh export глушится, и без этого
+# в архив мог бы попасть realm от предыдущего прогона.
 docker exec -i "${keycloak_container_id}" rm -f /opt/keycloak/visiology-realm.json 2>/dev/null || true
 docker exec "${keycloak_container_id}" /opt/keycloak/bin/kc.sh export \
     --file /opt/keycloak/visiology-realm.json --realm "${KEYCLOAK_REALM}" > "${error_output}" 2>&1 || true
@@ -825,13 +760,14 @@ docker exec -i "${keycloak_container_id}" test -s /opt/keycloak/visiology-realm.
 docker cp "${keycloak_container_id}":/opt/keycloak/visiology-realm.json "${REALM_FILE}"
 grep -q '"realm"' "${REALM_FILE}" || die "visiology-realm.json не похож на экспорт realm"
 
-# Чтение секретов: docker exec -i, БЕЗ -t. Это и есть починка (см. шапку файла).
+# Секреты читаются через docker exec -i, без -t.
 m2m_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_M2M_SECRET)
 grafana_client_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_GRAFANA_CLIENT_SECRET)
 public_dashboard_access_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_PUBLIC_DASHBOARD_ACCESS_SECRET)
 visiology_admin_realm_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_VISIOLOGY_ADMIN_REALM_SECRET)
 
-# Болванки. ОБЯЗАНЫ совпадать байт-в-байт с *_old в штатном restore.sh.
+# Значения-заглушки. Должны совпадать байт в байт с константами *_old в штатном
+# restore.sh, который выполняет обратную подстановку при восстановлении.
 m2m_secret_new="68c96230-43e8-4308-b0ae-65835d8de35e"
 grafana_client_secret_new="749e9d46-1360-4c65-a0a0-82ba3e369b09"
 public_dashboard_access_secret_new="49d410ba-4e0d-4b1a-a064-834f41fb1cfd"
@@ -840,25 +776,30 @@ visiology_admin_realm_secret_new="23e5da38-76e9-47d2-e12c-f0da9f039cc6"
 # Карта clientId строится ДО подмены - по реальным значениям секретов.
 write_keycloak_client_map
 
-replace_in_realm "${m2m_secret}"                    "${m2m_secret_new}"                    "KEYCLOAK_M2M_SECRET"
-replace_in_realm "${grafana_client_secret}"         "${grafana_client_secret_new}"         "KEYCLOAK_GRAFANA_CLIENT_SECRET"
-replace_in_realm "${public_dashboard_access_secret}" "${public_dashboard_access_secret_new}" "KEYCLOAK_PUBLIC_DASHBOARD_ACCESS_SECRET"
-replace_in_realm "${visiology_admin_realm_secret}"  "${visiology_admin_realm_secret_new}"  "KEYCLOAK_VISIOLOGY_ADMIN_REALM_SECRET"
+if [ "${KC_KEEP_SECRETS}" = "1" ]; then
+    log "  подмена секретов пропущена (--keep-keycloak-secrets)"
+    echo "Секреты клиентов оставлены без изменений по ключу --keep-keycloak-secrets." >> "${KC_WARN_FILE}"
+else
+    replace_in_realm "${m2m_secret}"                     "${m2m_secret_new}"                     "KEYCLOAK_M2M_SECRET"
+    replace_in_realm "${grafana_client_secret}"          "${grafana_client_secret_new}"          "KEYCLOAK_GRAFANA_CLIENT_SECRET"
+    replace_in_realm "${public_dashboard_access_secret}" "${public_dashboard_access_secret_new}" "KEYCLOAK_PUBLIC_DASHBOARD_ACCESS_SECRET"
+    replace_in_realm "${visiology_admin_realm_secret}"   "${visiology_admin_realm_secret_new}"   "KEYCLOAK_VISIOLOGY_ADMIN_REALM_SECRET"
 
-# Контроль: в realm-json не должно остаться ни одного секрета исходного стенда.
-for _s in "${m2m_secret}" "${grafana_client_secret}" "${public_dashboard_access_secret}" "${visiology_admin_realm_secret}"; do
-    if grep -qF -- "${_s}" "${REALM_FILE}"; then
-        die "в visiology-realm.json остался секрет исходного стенда - архив непереносим"
-    fi
-done
-unset _s
-# Байт \r внутри JSON-строки Keycloak при импорте не примет (Jackson валит на
-# unquoted control char), а restore.sh глушит ошибку импорта через || true -
-# realm при этом уже удалён. Проверяем явно.
+    # В realm-json не должно остаться ни одного секрета исходного стенда:
+    # иначе архив непереносим на другую установку.
+    for _s in "${m2m_secret}" "${grafana_client_secret}" "${public_dashboard_access_secret}" "${visiology_admin_realm_secret}"; do
+        if grep -qF -- "${_s}" "${REALM_FILE}"; then
+            die "в visiology-realm.json остался секрет исходного стенда"
+        fi
+    done
+    unset _s
+fi
+# Символ \r внутри строки JSON недопустим: импорт realm его не примет, а
+# restore.sh глушит ошибку импорта уже после удаления realm.
 if LC_ALL=C grep -q $'\r' "${REALM_FILE}"; then
     die "в visiology-realm.json есть символ \\r - kc.sh import такой файл не примет"
 fi
-log "  realm-json нормализован, секреты стенда в архив не попали"
+log "  realm-json готов"
 
 log "minio..."
 mkdir -p "${MN_FILES_HOST_PATH}"
@@ -919,8 +860,8 @@ sudo tar -cf - -C "${backup_file_dir}" backup | ${COMPRESSOR} > "${backup_file_d
 [ -s "${backup_file_dir}/${archive_name}" ] || die "архив не создан или пустой"
 
 if [ -f "${KC_WARN_FILE}" ]; then
-    warn "секреты Keycloak НЕ нормализованы - после restore обязательно выполните:"
-    warn "    ./visiology-keycloak-sync.sh"
+    warn "секреты Keycloak нормализованы не полностью, подробности в ${KC_WARN_FILE}"
+    warn "  после восстановления секреты клиентов нужно синхронизировать вручную"
 fi
 
 t_end=$(date +%s)
