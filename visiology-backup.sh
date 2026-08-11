@@ -63,8 +63,12 @@ while [ "$1" != "" ]; do
             echo "                backup/clickhouse/ИМЯ переносятся к основному"
             echo "                хосту и пакуются вместе с ним."
             echo "  --allow-partial-clickhouse"
-            echo "                не прерывать бэкап, если часть нод CH недоступна."
-            echo "                Архив помечается файлом CLICKHOUSE-PARTIAL.txt."
+            echo "                не прерывать бэкап, если часть нод CH недоступна"
+            echo "                или часть таблиц не выгрузилась (словари,"
+            echo "                Distributed - у временного CH нет доступа к их"
+            echo "                источникам и к конфигу кластера)."
+            echo "                Архив помечается файлом CLICKHOUSE-PARTIAL.txt"
+            echo "                со списком того, что не попало."
             echo
             echo "  --keep-keycloak-secrets"
             echo "                не подменять секреты в realm-json на болванки."
@@ -497,10 +501,27 @@ _dump_ch_node() {
     # ошибка, а не гонка, и архив собирать нельзя.
     if [ "${failed_cnt}" -gt 0 ] || [ "${done_sql}" -ne "${total}" ] || [ "${done_data}" -ne "${total}" ]; then
         warn "${host}: схем не хватает $(( total - done_sql )), данных $(( total - done_data )), ошибок: ${failed_cnt}"
-        find "${err_dir}" -type f -name '*.err' -printf '%f\n' 2>/dev/null | head -10 \
+        warn "${host}: не выгрузились (первые 20):"
+        find "${err_dir}" -type f -name '*.err' -printf '%f\n' 2>/dev/null | head -20 \
             | while IFS= read -r f; do warn "    ${f%.err}"; done
-        rm -rf "${err_dir}" "${tables_file}"
-        die "${host}: ClickHouse выгружен не полностью - архив собирать нельзя"
+        # Типичные причины: словари (нет доступа к их источникам с временного CH)
+        # и Distributed-таблицы (в временный контейнер не монтируется
+        # clickhousecluster.xml). Штатный дамп такие объекты молча пропускает.
+        if [ "${ALLOW_PARTIAL_CH}" = "1" ]; then
+            {
+                echo "${host}: выгружено схем ${done_sql}, данных ${done_data} из ${total}"
+                find "${err_dir}" -type f -name '*.err' -printf '%f\n' 2>/dev/null \
+                    | while IFS= read -r f; do echo "  не выгружено: ${f%.err}"; done
+            } >> "${MAIN_BACKUP_DIR}/CLICKHOUSE-PARTIAL.txt"
+            warn "${host}: продолжаю по --allow-partial-clickhouse, список в CLICKHOUSE-PARTIAL.txt"
+        else
+            rm -rf "${err_dir}" "${tables_file}"
+            die "${host}: ClickHouse выгружен не полностью.
+     Если в списке выше словари или Distributed-таблицы - это ожидаемо:
+     временный CH не имеет доступа к их источникам и к конфигу кластера,
+     штатный дамп такие объекты тоже пропускает.
+     Собрать архив с этим списком осознанно: $0 --allow-partial-clickhouse"
+        fi
     fi
 
     rm -rf "${err_dir}" "${tables_file}"
