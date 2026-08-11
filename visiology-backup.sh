@@ -343,7 +343,9 @@ _umount_lazy() {
 # Кто держит снапшот. Нужно, чтобы в логе было видно антивирус (kesl) или
 # другой процесс, а не просто "не удалось удалить".
 _snapshot_holders() {
-    log "  кто держит ${SNAP_MNT} / снапшот:"
+    local dev="/dev/${VG_NAME}/${SNAP_NAME}"
+    log "  кто держит ${SNAP_MNT} / ${dev}:"
+    sudo timeout 15 fuser -vm "${dev}" 2>&1 | head -10 | while IFS= read -r l; do log "      ${l}"; done || true
     if command -v fuser >/dev/null 2>&1; then
         sudo timeout 15 fuser -vm "${SNAP_MNT}" 2>&1 | head -10 | while IFS= read -r l; do log "      ${l}"; done || true
     fi
@@ -366,6 +368,15 @@ _remove_snapshot() {
         fi
         # показываем держателя один раз, если попыток много (не в раннем сносе)
         if [ "${i}" = "5" ]; then _snapshot_holders; fi
+        # Ленивое размонтирование отцепляет только ИМЯ: ФС внутри ядра живёт,
+        # пока держатель (обычно антивирус) не закроет дескрипторы, и всё это
+        # время LV занят. Точки монтирования уже нет, поэтому освобождаем по
+        # устройству. timeout - чтобы fuser не встал намертво.
+        if [ "${i}" = "10" ] || [ "${i}" = "25" ]; then
+            log "  снапшот занят, освобождаю держателей по устройству"
+            sudo timeout 20 fuser -km "/dev/${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1 || true
+            sudo timeout 20 fuser -km "/dev/mapper/${VG_NAME//-/--}-${SNAP_NAME//-/--}" >/dev/null 2>&1 || true
+        fi
         if [ "${i}" = "20" ]; then log "  снапшот всё ещё занят, продолжаю попытки..."; fi
         sudo lvchange -an "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1 || true
         sleep 3
