@@ -84,6 +84,9 @@ while [ "$1" != "" ]; do
             echo
             echo "Полный бэкап Visiology (postgres, smartforms, minio, keycloak,"
             echo "секреты, custom) + консистентный ClickHouse через LVM-снапшот."
+            echo
+            echo "Коды возврата: 0 - успех, 1 - ошибка, 3 - предыдущий прогон"
+            echo "ещё идёт, 20/127 - неверные аргументы."
             exit 0
             ;;
         "-d" | "--debug")
@@ -115,6 +118,24 @@ done
 
 # Ошибка в любом звене конвейера должна валить шаг, а не проглатываться.
 set -o pipefail
+
+# ЗАПУСК ИЗ CRON.
+# У cron минимальный PATH (обычно /usr/bin:/bin), а lvs/lvcreate/lvremove живут
+# в /usr/sbin. Все вызовы LVM идут через sudo и покрываются его secure_path, но
+# полагаться на это не стоит - задаём PATH явно.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
+# Блокировка. Полный бэкап идёт часами; если следующий запуск по расписанию
+# наложится на предыдущий, получим две попытки создать одноимённый снапшот и
+# два временных ClickHouse. Второй запуск просто выходит с кодом 3.
+LOCK_DIR=/var/lock
+[ -w "${LOCK_DIR}" ] || LOCK_DIR=/tmp
+LOCK_FILE="${LOCK_DIR}/visiology-backup.lock"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+    echo "$(date '+%F %T') [visiology-backup] предыдущий бэкап ещё выполняется (${LOCK_FILE}), выходим" >&2
+    exit 3
+fi
 
 SCRIPT_DIR=$( dirname -- "$( readlink -f -- "$0")")
 pushd "${SCRIPT_DIR}" >/dev/null
@@ -231,20 +252,6 @@ copy_secret_file() {
 # Экранирование для sed: BRE-шаблон и строка замены (разделитель '/').
 _esc_bre()  { printf '%s' "$1" | sed 's@[][\\.*^$/]@\\&@g'; }
 _esc_repl() { printf '%s' "$1" | sed 's@[\\&/]@\\&@g'; }
-
-# Проверка: добавляет ли чтение секрета через tty символ \r.
-# Именно из-за него подмена секретов исторически не срабатывала, и он же
-# испортит realm-json на стороне штатного restore.sh, где значение попадает
-# в ПРАВУЮ часть sed. Возвращает 0, если tty портит значение.
-kc_tty_differs() {
-    local cid="$1" name="$2" clean tty_val
-    clean=$(docker exec -i "${cid}" cat "/run/secrets/${name}" 2>/dev/null | tr -d '\r\n') || clean=""
-    # -t без -i: псевдотерминал выделяется, но stdin не требуется - работает и из cron
-    tty_val=$(docker exec -t "${cid}" cat "/run/secrets/${name}" 2>/dev/null) || tty_val=""
-    [ -n "${clean}" ] || return 1
-    [ -n "${tty_val}" ] || return 1
-    [ "${clean}" != "${tty_val}" ]
-}
 
 # Подмена секрета в realm-json с проверкой ДО и ПОСЛЕ.
 # Отсутствие этих проверок и делало поломку невидимой: sed возвращает 0,
