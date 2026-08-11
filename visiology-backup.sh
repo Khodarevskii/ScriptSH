@@ -47,7 +47,7 @@ while [ "$1" != "" ]; do
     case "$1" in
         "-?" | "-h" | "--help")
             echo "Usage: $0 [-d|--debug] [--ch-node ИМЯ] [--allow-partial-clickhouse]"
-            echo "          [--ignore-keycloak-secret-mismatch] [-h|--help]"
+            echo "          [--keep-keycloak-secrets] [--ch-only] [-h|--help]"
             echo "  -d, --debug   режим отладки (трассировка команд, показ ошибок)"
             echo "  -h, --help    эта справка"
             echo
@@ -340,13 +340,23 @@ _remove_snapshot() {
     return 1
 }
 
+# Снос временных контейнеров CH (их может быть несколько - по одному на ноду).
+# ВАЖНО: конвейер обёрнут в $( ... || true). При set -o pipefail пустой вывод
+# grep возвращает 1, и голый конвейер под `set -e` обрывал бы весь скрипт -
+# именно на этом первый прогон и остановился.
+_rm_temp_ch_containers() {
+    local names n
+    names=$(sudo docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${CH_TEMP_NAME}" || true)
+    for n in ${names}; do
+        sudo docker rm -f "${n}" >/dev/null 2>&1 || true
+    done
+}
+
 cleanup() {
     local rc=$?
     log "очистка CH-ресурсов..."
     # Временных контейнеров может быть несколько (по одному на ноду CH).
-    sudo docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${CH_TEMP_NAME}" | while IFS= read -r n; do
-        sudo docker rm -f "${n}" >/dev/null 2>&1 || true
-    done
+    _rm_temp_ch_containers
     if [ "${SNAP_MOUNTED}" = "1" ] || mountpoint -q "${SNAP_MNT}" 2>/dev/null; then
         _umount_lazy "${SNAP_MNT}"
     fi
@@ -358,7 +368,9 @@ cleanup() {
     if [ "${CH_COPY_CREATED}" = "1" ] || [ -d "${CH_COPY_DIR}" ]; then
         sudo rm -rf "${CH_COPY_DIR}" >/dev/null 2>&1 || true
     fi
-    [ "${rc}" -ne 0 ] && log "завершено с ошибкой (код ${rc})."
+    if [ "${rc}" -ne 0 ]; then
+        log "завершено с ошибкой (код ${rc})."
+    fi
     exit "${rc}"
 }
 trap 'trap "" INT TERM; cleanup' EXIT
@@ -569,9 +581,7 @@ dump_clickhouse() {
 
     log "ClickHouse: снапшот и выгрузка (${#locals[@]} нод)..."
 
-    sudo docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${CH_TEMP_NAME}" | while IFS= read -r n; do
-        sudo docker rm -f "${n}" >/dev/null 2>&1 || true
-    done
+    _rm_temp_ch_containers
     if sudo lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
         _umount_lazy "${SNAP_MNT}"; _remove_snapshot || true
     fi
