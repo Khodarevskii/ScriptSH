@@ -7,8 +7,10 @@
 #
 # Не-CH части (postgres, smartforms, minio, keycloak, секреты, custom) делаются
 # ТЕМИ ЖЕ командами, что штатный backup.sh. ClickHouse снимается своей логикой:
-# LVM-снапшот корня (rw) -> временный CH на снапшоте -> параллельная выгрузка
-# в штатный формат Native. Консистентный срез CH без падений.
+# LVM-снапшот корня (ro) -> копия данных CH в отдельный каталог -> временный CH
+# на копии -> параллельная выгрузка в штатный формат Native.
+# Снапшот живёт до конца прогона, вся уборка (снапшот, монтирование, копия,
+# временные контейнеры) вынесена в cleanup по завершении.
 #
 # Кладётся В ТУ ЖЕ ПАПКУ, что штатный backup.sh (нужны config.env/defaults.env
 # и относительные пути extended-services/env-files/custom-configs).
@@ -324,7 +326,15 @@ _umount_lazy() {
         if sudo umount "${mp}" >/dev/null 2>&1; then return 0; fi
         sleep 2
     done
-    sudo fuser -km "${mp}" >/dev/null 2>&1 || true
+    # Ленивое размонтирование отцепляет ФС сразу, даже если она занята, и почти
+    # никогда не блокируется. Пробуем ЕГО, а не fuser - именно на fuser скрипт и вис.
+    if sudo umount -l "${mp}" >/dev/null 2>&1; then
+        sleep 1
+        mountpoint -q "${mp}" 2>/dev/null || return 0
+    fi
+    # Последнее средство. fuser обходит весь /proc и на занятой точке умеет висеть
+    # минутами (тут ещё и k8s рядом), поэтому под timeout. -k шлёт SIGKILL держателям.
+    sudo timeout 20 fuser -km "${mp}" >/dev/null 2>&1 || true
     sleep 1
     sudo umount -l "${mp}" >/dev/null 2>&1 || true
 }
@@ -334,10 +344,10 @@ _umount_lazy() {
 _snapshot_holders() {
     log "  кто держит ${SNAP_MNT} / снапшот:"
     if command -v fuser >/dev/null 2>&1; then
-        sudo fuser -vm "${SNAP_MNT}" 2>&1 | head -10 | while IFS= read -r l; do log "      ${l}"; done || true
+        sudo timeout 15 fuser -vm "${SNAP_MNT}" 2>&1 | head -10 | while IFS= read -r l; do log "      ${l}"; done || true
     fi
     if command -v lsof >/dev/null 2>&1; then
-        sudo lsof "${SNAP_MNT}" 2>/dev/null | head -10 | while IFS= read -r l; do log "      ${l}"; done || true
+        sudo timeout 15 lsof "${SNAP_MNT}" 2>/dev/null | head -10 | while IFS= read -r l; do log "      ${l}"; done || true
     fi
     sudo dmsetup info -c 2>/dev/null | grep -i "${SNAP_NAME}" | while IFS= read -r l; do log "      ${l}"; done || true
 }
@@ -647,26 +657,13 @@ dump_clickhouse() {
         log "  ${chost}: копия готова ($(sudo du -sh "${CH_COPY_DIR}/${chost}" 2>/dev/null | cut -f1))"
     done
 
-    # Снапшот больше не нужен - удаляем СРАЗУ, до выгрузки таблиц.
-    # Это суть модели копии: пока снапшот жив, записи боевой системы в корень
-    # копятся в COW. Выгрузка идёт часами, COW столько не выдержит.
-    log "  удаляю снапшот"
-    _umount_lazy "${SNAP_MNT}"
-    SNAP_MOUNTED=0
-    if _remove_snapshot 3; then
-        SNAP_CREATED=0
-        log "  снапшот удалён, COW освобождён"
-    else
-        # Не авария: копия уже снята, выгрузка идёт с неё, origin не страдает.
-        # Переполнение COW всего лишь пометит снапшот invalid. Цена в том, что
-        # пока он жив, каждая запись в корень платит copy-on-write - боевая
-        # система пишет медленнее. Поэтому пробуем ещё раз после выгрузки и
-        # в самом конце через trap.
-        warn "снапшот занят, не жду (обычно его держит антивирус на ${SNAP_MNT})."
-        warn "  На данные это не влияет: выгрузка идёт с копии в ${CH_COPY_DIR}."
-        warn "  Пока снапшот жив, записи в корень идут медленнее. Повторю после выгрузки."
-        _snapshot_holders
-    fi
+    # Снапшот НЕ трогаем здесь - вся уборка вынесена в конец скрипта (cleanup).
+    # Он остаётся смонтированным и живым до завершения прогона.
+    # Плата за это: пока снапшот существует, каждая запись в корень выполняет
+    # copy-on-write, то есть боевая система пишет медленнее всё время выгрузки.
+    # На сохранность данных это не влияет - выгрузка идёт с копии в CH_COPY_DIR,
+    # а переполнение COW лишь пометит снапшот invalid, origin не пострадает.
+    log "  снапшот оставлен до конца прогона, уборка будет в конце"
 
     # Глушащий конфиг: отключаем системные лог-таблицы (чтобы CH не тратил
     # ресурсы и не раздувал копию логами при работе).
@@ -702,20 +699,6 @@ XMLEOF
         # копию удаляем сразу - на многонодовой установке иначе нужен суммарный объём
         sudo rm -rf "${CH_COPY_DIR:?}/${chost}" >/dev/null 2>&1 || true
     done
-
-    # Выгрузка закончена. Если снапшот пережил ранний снос - пробуем снова,
-    # чтобы снять штраф на запись до долгой упаковки, а не после неё.
-    if [ "${SNAP_CREATED}" = "1" ]; then
-        log "  повторная попытка удалить снапшот"
-        _umount_lazy "${SNAP_MNT}"
-        SNAP_MOUNTED=0
-        if _remove_snapshot; then
-            SNAP_CREATED=0
-            log "  снапшот удалён"
-        else
-            warn "снапшот всё ещё занят, последняя попытка будет при завершении"
-        fi
-    fi
 
     if [ ${#remotes[@]} -gt 0 ]; then
         local r rhost rsvc rnode
