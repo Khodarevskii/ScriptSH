@@ -321,23 +321,23 @@ PYEOF
 
 _umount_lazy() {
     local mp="$1"
-    mountpoint -q "${mp}" 2>/dev/null || return 0
+    timeout 10 mountpoint -q "${mp}" 2>/dev/null || return 0
     local i
     for i in 1 2 3; do
-        if sudo umount "${mp}" >/dev/null 2>&1; then return 0; fi
+        if sudo timeout 30 umount "${mp}" >/dev/null 2>&1; then return 0; fi
         sleep 2
     done
     # Ленивое размонтирование отцепляет ФС сразу, даже если она занята, и почти
     # никогда не блокируется. Пробуем ЕГО, а не fuser - именно на fuser скрипт и вис.
     if sudo umount -l "${mp}" >/dev/null 2>&1; then
         sleep 1
-        mountpoint -q "${mp}" 2>/dev/null || return 0
+        timeout 10 mountpoint -q "${mp}" 2>/dev/null || return 0
     fi
     # Последнее средство. fuser обходит весь /proc и на занятой точке умеет висеть
     # минутами (тут ещё и k8s рядом), поэтому под timeout. -k шлёт SIGKILL держателям.
     sudo timeout 20 fuser -km "${mp}" >/dev/null 2>&1 || true
     sleep 1
-    sudo umount -l "${mp}" >/dev/null 2>&1 || true
+    sudo timeout 30 umount -l "${mp}" >/dev/null 2>&1 || true
 }
 
 # Кто держит снапшот. Нужно, чтобы в логе было видно антивирус (kesl) или
@@ -359,10 +359,10 @@ _snapshot_holders() {
 # снапшот занят, ждать перед выгрузкой бессмысленно - всё равно идём дальше.
 # Настойчивые попытки оставлены на конец, где ожидание никого не задерживает.
 _remove_snapshot() {
-    sudo lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1 || return 0
+    sudo timeout 15 lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1 || return 0
     local attempts="${1:-40}" i
     for i in $(seq 1 "${attempts}"); do
-        if sudo lvremove -y "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
+        if sudo timeout 60 lvremove -y "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
             [ "${i}" -gt 1 ] && log "  снапшот удалён с попытки ${i}"
             return 0
         fi
@@ -378,8 +378,8 @@ _remove_snapshot() {
             sudo timeout 20 fuser -km "/dev/mapper/${VG_NAME//-/--}-${SNAP_NAME//-/--}" >/dev/null 2>&1 || true
         fi
         if [ "${i}" = "20" ]; then log "  снапшот всё ещё занят, продолжаю попытки..."; fi
-        sudo lvchange -an "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1 || true
-        sleep 3
+        sudo timeout 30 lvchange -an "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1 || true
+        [ "${i}" -lt "${attempts}" ] && sleep 3
     done
     return 1
 }
@@ -404,7 +404,7 @@ cleanup() {
     if [ "${SNAP_MOUNTED}" = "1" ] || mountpoint -q "${SNAP_MNT}" 2>/dev/null; then
         _umount_lazy "${SNAP_MNT}"
     fi
-    if [ "${SNAP_CREATED}" = "1" ] || sudo lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
+    if [ "${SNAP_CREATED}" = "1" ] || sudo timeout 15 lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
         if _remove_snapshot; then
             log "  снапшот удалён"
         else
@@ -635,7 +635,7 @@ dump_clickhouse() {
     log "ClickHouse: снапшот и выгрузка (${#locals[@]} нод)..."
 
     _rm_temp_ch_containers
-    if sudo lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
+    if sudo timeout 15 lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
         _umount_lazy "${SNAP_MNT}"; _remove_snapshot || true
     fi
 
@@ -679,9 +679,20 @@ dump_clickhouse() {
     # то есть боевая система пишет медленнее всё время выгрузки. Данным это
     # не грозит - выгрузка идёт с копии, а переполнение COW лишь пометит
     # снапшот invalid, origin не пострадает.
-    log "  отмонтирую ${SNAP_MNT} (снапшот остаётся до конца прогона)"
+    log "  отмонтирую ${SNAP_MNT}"
     _umount_lazy "${SNAP_MNT}"
     SNAP_MOUNTED=0
+
+    # ОДНА попытка снести снапшот сразу. Все операции внутри ограничены по
+    # времени (timeout), поэтому встать здесь скрипт не может. Получилось -
+    # дальше система пишет без налога copy-on-write. Не получилось - молча
+    # идём выгружать, снесём в конце.
+    if _remove_snapshot 1; then
+        SNAP_CREATED=0
+        log "  снапшот удалён, COW освобождён"
+    else
+        log "  снапшот занят, останется до конца прогона (уборка в конце)"
+    fi
 
     # Глушащий конфиг: отключаем системные лог-таблицы (чтобы CH не тратил
     # ресурсы и не раздувал копию логами при работе).
