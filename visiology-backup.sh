@@ -35,8 +35,8 @@
 COMMAND_LINE="$0 $*"
 error_output=/dev/null
 
-# Поведение при рассинхроне секретов Keycloak (см. --ignore-keycloak-secret-mismatch)
-IGNORE_KC_MISMATCH=0
+# Оставить в realm-json секреты этого стенда, не подменяя их на болванки
+KC_KEEP_SECRETS=0
 # Ноды ClickHouse: разрешить неполный дамп и выгрузка одной конкретной ноды
 ALLOW_PARTIAL_CH=0
 CH_ONLY_NODE=""
@@ -66,11 +66,13 @@ while [ "$1" != "" ]; do
             echo "                не прерывать бэкап, если часть нод CH недоступна."
             echo "                Архив помечается файлом CLICKHOUSE-PARTIAL.txt."
             echo
-            echo "  --ignore-keycloak-secret-mismatch"
-            echo "                не прерывать бэкап, если секрет клиента в Keycloak"
-            echo "                не совпадает с docker secret. Архив в этом случае"
-            echo "                помечается файлом KEYCLOAK-SECRETS-NOT-NORMALIZED.txt"
-            echo "                и потребует ручной синхронизации после restore."
+            echo "  --keep-keycloak-secrets"
+            echo "                не подменять секреты в realm-json на болванки."
+            echo "                По умолчанию скрипт решает это сам: если чтение"
+            echo "                секрета через tty добавляет \\r, штатный restore.sh"
+            echo "                испортит JSON при обратной подстановке, и подмена"
+            echo "                пропускается. Секреты в любом случае синхронизируются"
+            echo "                вручную после восстановления."
             echo
             echo "Полный бэкап Visiology (postgres, smartforms, minio, keycloak,"
             echo "секреты, custom) + консистентный ClickHouse через LVM-снапшот."
@@ -80,8 +82,8 @@ while [ "$1" != "" ]; do
             set -x
             error_output=/dev/fd/1
             ;;
-        "--ignore-keycloak-secret-mismatch")
-            IGNORE_KC_MISMATCH=1
+        "--keep-keycloak-secrets")
+            KC_KEEP_SECRETS=1
             ;;
         "--allow-partial-clickhouse")
             ALLOW_PARTIAL_CH=1
@@ -164,7 +166,7 @@ CUSTOM_CONFIGS_PATH="custom-configs"
 COMMAND_FILE="command.txt"
 REALM_FILE="${MAIN_BACKUP_DIR}/visiology-realm.json"
 KC_MAP_FILE="${MAIN_BACKUP_DIR}/keycloak-clients.map"
-KC_WARN_FILE="${MAIN_BACKUP_DIR}/KEYCLOAK-SECRETS-NOT-NORMALIZED.txt"
+KC_WARN_FILE="${MAIN_BACKUP_DIR}/KEYCLOAK-SECRETS-README.txt"
 
 LOG_TAG="[visiology-backup]"
 log() { echo "$(date '+%F %T') ${LOG_TAG} $*"; }
@@ -222,36 +224,46 @@ copy_secret_file() {
 _esc_bre()  { printf '%s' "$1" | sed 's@[][\\.*^$/]@\\&@g'; }
 _esc_repl() { printf '%s' "$1" | sed 's@[\\&/]@\\&@g'; }
 
+# Проверка: добавляет ли чтение секрета через tty символ \r.
+# Именно из-за него подмена секретов исторически не срабатывала, и он же
+# испортит realm-json на стороне штатного restore.sh, где значение попадает
+# в ПРАВУЮ часть sed. Возвращает 0, если tty портит значение.
+kc_tty_differs() {
+    local cid="$1" name="$2" clean tty_val
+    clean=$(docker exec -i "${cid}" cat "/run/secrets/${name}" 2>/dev/null | tr -d '\r\n') || clean=""
+    # -t без -i: псевдотерминал выделяется, но stdin не требуется - работает и из cron
+    tty_val=$(docker exec -t "${cid}" cat "/run/secrets/${name}" 2>/dev/null) || tty_val=""
+    [ -n "${clean}" ] || return 1
+    [ -n "${tty_val}" ] || return 1
+    [ "${clean}" != "${tty_val}" ]
+}
+
 # Подмена секрета в realm-json с проверкой ДО и ПОСЛЕ.
-# Именно отсутствие этих проверок делало поломку невидимой: sed возвращает 0,
+# Отсутствие этих проверок и делало поломку невидимой: sed возвращает 0,
 # даже когда не нашёл ни одного совпадения.
+# Бэкап из-за секретов НЕ прерывается: расхождения отмечаются в KC_WARN_FILE
+# и правятся вручную после восстановления.
 replace_in_realm() {
     local old="$1" new="$2" label="$3"
 
-    [ -n "${old}" ] || die "${label}: пустое исходное значение секрета"
-    [ -n "${new}" ] || die "${label}: пустая болванка"
+    if [ -z "${old}" ] || [ -z "${new}" ]; then
+        warn "${label}: пустое значение, подмена пропущена"
+        echo "${label}: значение не получено, в realm-json осталось как есть" >> "${KC_WARN_FILE}"
+        return 0
+    fi
 
     if ! grep -qF -- "${old}" "${REALM_FILE}"; then
-        if [ "${IGNORE_KC_MISMATCH}" = "1" ]; then
-            warn "${label}: значение из /run/secrets не найдено в visiology-realm.json - подмена пропущена"
-            echo "${label}: секрет клиента в Keycloak не совпадает с docker secret, болванка не подставлена" >> "${KC_WARN_FILE}"
-            return 0
-        fi
-        die "${label}: значение из /run/secrets НЕ НАЙДЕНО в visiology-realm.json.
-     Это ровно та ситуация, из-за которой архив потом не поднимается: restore.sh
-     не найдёт болванку и оставит в realm секреты чужого стенда.
-     Возможные причины:
-       1) секрет клиента в Keycloak разошёлся с docker secret на ЭТОМ стенде -
-          синхронизируйте: ./visiology-keycloak-sync.sh
-       2) kc.sh export отдал устаревший/неполный realm - проверьте вывод с -d
-     Обойти проверку осознанно: $0 --ignore-keycloak-secret-mismatch"
+        warn "${label}: значение из /run/secrets не найдено в visiology-realm.json"
+        echo "${label}: секрет клиента в Keycloak не совпадает с docker secret этого стенда" >> "${KC_WARN_FILE}"
+        return 0
     fi
 
     sed -i "s/$(_esc_bre "${old}")/$(_esc_repl "${new}")/g" "${REALM_FILE}"
 
-    grep -qF -- "${new}" "${REALM_FILE}" || die "${label}: болванка не появилась в realm-json"
-    if grep -qF -- "${old}" "${REALM_FILE}"; then
-        die "${label}: исходный секрет остался в realm-json после подмены"
+    if ! grep -qF -- "${new}" "${REALM_FILE}" || grep -qF -- "${old}" "${REALM_FILE}"; then
+        warn "${label}: подмена применилась не полностью"
+        echo "${label}: подмена на болванку не завершилась, проверьте realm-json" >> "${KC_WARN_FILE}"
+        return 0
     fi
     log "  ${label}: подменён на болванку"
 }
