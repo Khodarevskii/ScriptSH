@@ -414,30 +414,39 @@ _dump_ch_node() {
     sudo mkdir -p "${sql_dir}" "${data_dir}"
     sudo chown -R "$(id -u):$(id -g)" "${MAIN_BACKUP_DIR}/clickhouse"
 
-    local tables_file
+    local tables_file nodata_file
     tables_file=$(mktemp)
+    nodata_file=$(mktemp)
     sudo docker exec "${cname}" clickhouse-client -d "${CH_DB}" -q "SHOW TABLES FORMAT TSVRaw" \
         | grep -v 'jemalloc' | grep -v '^cache_queries_' > "${tables_file}" || true
     local total
     total=$(wc -l < "${tables_file}")
     [ "${total}" -gt 0 ] || die "нода ${idx}: не получен список таблиц"
-    log "  нода ${idx}: таблиц к выгрузке: ${total}"
 
-    # Справочно: View/MaterializedView/Dictionary выгружаются как обычные таблицы
-    # (SELECT * ... FORMAT Native), и при restore INSERT в них может не пройти.
-    local odd
-    odd=$(sudo docker exec "${cname}" clickhouse-client -q \
-        "SELECT engine || ': ' || toString(count()) FROM system.tables
-         WHERE database='${CH_DB}' AND (engine LIKE '%View' OR engine='Dictionary')
-         GROUP BY engine FORMAT TSVRaw" 2>/dev/null) || odd=""
-    if [ -n "${odd}" ]; then
-        warn "нода ${idx}: есть представления/словари, они попадут в дамп как обычные таблицы:"
-        printf '%s\n' "${odd}" | while IFS= read -r l; do warn "    ${l}"; done
-    fi
+    # Объекты, для которых данные НЕ выгружаются: у представлений и словарей
+    # своего хранилища нет. В эталонном штатном архиве это видно по числам:
+    # sql/ 7232 файла против data/ 7210 - ровно на количество таких объектов.
+    # Раньше скрипт делал для них SELECT * FORMAT Native: у View это исполняло
+    # запрос и клало в архив данные, которых там быть не должно, а при restore
+    # INSERT в представление не прошёл бы.
+    local nodata_raw
+    nodata_raw=$(mktemp)
+    sudo docker exec "${cname}" clickhouse-client -q \
+        "SELECT name FROM system.tables
+         WHERE database='${CH_DB}' AND engine IN ('View','Dictionary') FORMAT TSVRaw" \
+        2>/dev/null > "${nodata_raw}" || true
+    # только те, что реально попали в список выгрузки (jemalloc/cache_queries_ отсеяны выше),
+    # иначе ожидаемое число файлов данных занизится и проверка полноты соврёт
+    grep -Fxf "${tables_file}" "${nodata_raw}" > "${nodata_file}" 2>/dev/null || true
+    rm -f "${nodata_raw}"
+    local nodata_cnt expected_data
+    nodata_cnt=$(wc -l < "${nodata_file}")
+    expected_data=$(( total - nodata_cnt ))
+    log "  нода ${idx}: объектов ${total}, из них без данных ${nodata_cnt} (View/Dictionary)"
 
     local err_dir
     err_dir=$(mktemp -d)
-    export CH_TEMP_NAME CH_DB sql_dir data_dir err_dir
+    export CH_TEMP_NAME CH_DB sql_dir data_dir err_dir nodata_file
     export cname
     _dump_one() {
         local table="$1"
@@ -446,6 +455,10 @@ _dump_ch_node() {
                 -q "SHOW CREATE TABLE \"${table}\"" --format TabSeparatedRaw \
                 > "${sql_dir}/${table}.sql" 2>"${err_dir}/${table}.err"; then
             rm -f "${sql_dir}/${table}.sql" "${data_dir}/${table}"; return 1
+        fi
+        # View/Dictionary: только схема, как в штатном архиве
+        if grep -qxF -- "${table}" "${nodata_file}"; then
+            rm -f "${err_dir}/${table}.err"; return 0
         fi
         if ! sudo docker exec "${cname}" clickhouse-client -d "${CH_DB}" \
                 -q "SELECT * FROM \"${table}\" FORMAT Native" \
@@ -460,22 +473,25 @@ _dump_ch_node() {
 
     xargs -P "${DUMP_PARALLEL}" -I {} bash -c '_dump_one "$@"' _ {} < "${tables_file}" || true
 
-    local done_cnt failed_cnt
-    done_cnt=$(find "${sql_dir}" -name '*.sql' | wc -l)
-    failed_cnt=$(find "${err_dir}" -name '*.err' | wc -l)
-    log "  нода ${idx}: выгружено таблиц ${done_cnt} из ${total}"
+    # Считаем схемы и данные раздельно: их количества в норме РАЗНЫЕ.
+    # Эти два числа сравниваются с эталонным штатным архивом напрямую.
+    local done_sql done_data failed_cnt
+    done_sql=$(find "${sql_dir}" -type f -name '*.sql' | wc -l)
+    done_data=$(find "${data_dir}" -type f | wc -l)
+    failed_cnt=$(find "${err_dir}" -type f -name '*.err' | wc -l)
+    log "  нода ${idx}: sql ${done_sql} из ${total}, data ${done_data} из ${expected_data}"
 
     # Раньше проверялось только "выгружена хотя бы одна таблица" - неполный дамп
     # уезжал в архив как успешный и вскрывался только на restore.
-    if [ "${failed_cnt}" -gt 0 ] || [ "${done_cnt}" -ne "${total}" ]; then
-        warn "нода ${idx}: не выгружено таблиц $(( total - done_cnt )), ошибок: ${failed_cnt}"
-        find "${err_dir}" -name '*.err' -printf '%f\n' 2>/dev/null | head -10 \
+    if [ "${failed_cnt}" -gt 0 ] || [ "${done_sql}" -ne "${total}" ] || [ "${done_data}" -ne "${expected_data}" ]; then
+        warn "нода ${idx}: схем не хватает $(( total - done_sql )), данных $(( expected_data - done_data )), ошибок: ${failed_cnt}"
+        find "${err_dir}" -type f -name '*.err' -printf '%f\n' 2>/dev/null | head -10 \
             | while IFS= read -r f; do warn "    ${f%.err}"; done
-        rm -rf "${err_dir}" "${tables_file}"
+        rm -rf "${err_dir}" "${tables_file}" "${nodata_file}"
         die "нода ${idx}: ClickHouse выгружен не полностью - архив собирать нельзя"
     fi
 
-    rm -rf "${err_dir}" "${tables_file}"
+    rm -rf "${err_dir}" "${tables_file}" "${nodata_file}"
     sudo docker rm -f "${cname}" >/dev/null 2>&1 || true
 }
 
