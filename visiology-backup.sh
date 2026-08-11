@@ -399,34 +399,49 @@ _rm_temp_ch_containers() {
 
 cleanup() {
     local rc=$?
-    log "очистка CH-ресурсов..."
-    # Временных контейнеров может быть несколько (по одному на ноду CH).
+    log "очистка..."
+
+    # ПОРЯДОК ВАЖЕН. Сначала то, что выполняется быстро и освобождает место:
+    # копия данных CH занимает столько же, сколько сама база (на стенде 16 ГБ),
+    # и корень без неё дышит свободнее. Возня со снапшотом идёт последней,
+    # потому что она единственная может подвиснуть, и терять из-за неё
+    # освобождение диска нельзя.
     _rm_temp_ch_containers
-    if [ "${SNAP_MOUNTED}" = "1" ] || mountpoint -q "${SNAP_MNT}" 2>/dev/null; then
-        _umount_lazy "${SNAP_MNT}"
+    sudo rm -rf /tmp/vis_ch_conf >/dev/null 2>&1 || true
+    if [ "${CH_COPY_CREATED}" = "1" ] || [ -d "${CH_COPY_DIR}" ]; then
+        log "  удаляю копию данных CH (${CH_COPY_DIR})"
+        sudo rm -rf "${CH_COPY_DIR}" >/dev/null 2>&1 || true
     fi
+
+    # Дальше - снапшот. Здесь возможно зависание: umount на снапшоте, который
+    # держит антивирус, уходит в непрерываемый сон, и timeout его не убивает.
+    # Поэтому команды для ручной уборки печатаем ДО попытки, а не после -
+    # чтобы они остались на экране, даже если придётся прервать по Ctrl+C.
     if [ "${SNAP_CREATED}" = "1" ] || sudo timeout 15 lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
+        log "  убираю снапшот. Если подвиснет - архив уже собран, Ctrl+C безопасен,"
+        log "  а снапшот потом снимается вручную:"
+        log "    sudo umount -l ${SNAP_MNT}; sudo lvremove -y ${VG_NAME}/${SNAP_NAME}"
+
+        if [ "${SNAP_MOUNTED}" = "1" ] || timeout 10 mountpoint -q "${SNAP_MNT}" 2>/dev/null; then
+            _umount_lazy "${SNAP_MNT}"
+        fi
         if _remove_snapshot; then
             log "  снапшот удалён"
         else
             _snapshot_holders
-            warn "СНАПШОТ ${VG_NAME}/${SNAP_NAME} ОСТАЛСЯ. Он продолжит копить COW."
-            warn "  Убрать вручную:"
-            warn "    sudo fuser -km ${SNAP_MNT}"
-            warn "    sudo umount -l ${SNAP_MNT}"
-            warn "    sudo lvremove -y ${VG_NAME}/${SNAP_NAME}"
+            warn "СНАПШОТ ${VG_NAME}/${SNAP_NAME} ОСТАЛСЯ и продолжит копить COW."
+            warn "  Снять вручную (командами выше). Следующий прогон бэкапа"
+            warn "  без этого не начнётся: одноимённый снапшот создать нельзя."
         fi
     fi
     sudo rmdir "${SNAP_MNT}" >/dev/null 2>&1 || true
-    sudo rm -rf /tmp/vis_ch_conf >/dev/null 2>&1 || true
-    if [ "${CH_COPY_CREATED}" = "1" ] || [ -d "${CH_COPY_DIR}" ]; then
-        sudo rm -rf "${CH_COPY_DIR}" >/dev/null 2>&1 || true
-    fi
+
     if [ "${rc}" -ne 0 ]; then
         log "завершено с ошибкой (код ${rc})."
     fi
     exit "${rc}"
 }
+
 trap 'trap "" INT TERM; cleanup' EXIT
 trap 'exit 130' INT TERM
 
@@ -637,6 +652,11 @@ dump_clickhouse() {
 
     _rm_temp_ch_containers
     if sudo timeout 15 lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
+        # Остатки прошлого прогона. Убрать обязательно: lvcreate с тем же именем
+        # не пройдёт. Если снапшот держит антивирус, здесь можно подвиснуть -
+        # тогда снимайте вручную и запускайте заново.
+        warn "остался снапшот ${VG_NAME}/${SNAP_NAME} от прошлого прогона, убираю"
+        warn "  если встанет надолго: sudo umount -l ${SNAP_MNT}; sudo lvremove -y ${VG_NAME}/${SNAP_NAME}"
         _umount_lazy "${SNAP_MNT}"; _remove_snapshot || true
     fi
 
