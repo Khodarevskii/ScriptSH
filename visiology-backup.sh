@@ -163,7 +163,9 @@ EXTENDED_SERVICES_PATH="extended-services"
 ENV_FILES_PATH="env-files"
 CUSTOM_CONFIGS_PATH="custom-configs"
 COMMAND_FILE="command.txt"
+KC_SERVER="http://localhost:8080/v3/keycloak"
 REALM_FILE="${MAIN_BACKUP_DIR}/visiology-realm.json"
+KC_IDP_DIR="${MAIN_BACKUP_DIR}/keycloak-idp"
 KC_MAP_FILE="${MAIN_BACKUP_DIR}/keycloak-clients.map"
 KC_WARN_FILE="${MAIN_BACKUP_DIR}/KEYCLOAK-SECRETS-README.txt"
 
@@ -249,6 +251,46 @@ replace_in_realm() {
         return 0
     fi
     log "  ${label}: подменён на болванку"
+}
+
+# Вызов kcadm внутри контейнера Keycloak. Учётные данные читаются из
+# /run/secrets самим контейнером и в argv не попадают.
+#   $1 - идентификатор контейнера, далее - аргументы kcadm
+_kcadm() {
+    local cid="$1"; shift
+    docker exec -i "${cid}" bash -c '
+        KCADM=/opt/keycloak/bin/kcadm.sh
+        "${KCADM}" config credentials --server "$1" --realm master \
+            --user "$(cat /run/secrets/KEYCLOAK_ADMIN)" \
+            --password "$(cat /run/secrets/KEYCLOAK_ADMIN_PASSWORD)" >/dev/null 2>&1 || exit 1
+        shift
+        "${KCADM}" "$@"
+    ' _ "${KC_SERVER}" "$@"
+}
+
+# Identity providers и их мапперы сохраняются отдельно от экспорта realm.
+# Экспорт может не содержать identityProviderMappers, а без них после
+# восстановления перестаёт работать вход через внешний SSO: провайдер есть,
+# но группы и атрибуты из токена никуда не переносятся.
+# Данные складываются в keycloak-idp/ как есть, в формате Admin API.
+dump_keycloak_idp() {
+    local cid="$1" aliases a cnt
+    aliases=$(_kcadm "${cid}" get identity-provider/instances -r "${KEYCLOAK_REALM}" \
+        --fields alias --format csv --noquotes 2>/dev/null | tr -d '\r"') || aliases=""
+    if [ -z "${aliases}" ]; then
+        log "  identity providers не настроены"
+        return 0
+    fi
+    mkdir -p "${KC_IDP_DIR}"
+    _kcadm "${cid}" get identity-provider/instances -r "${KEYCLOAK_REALM}" \
+        > "${KC_IDP_DIR}/instances.json" 2>/dev/null || true
+    for a in ${aliases}; do
+        _kcadm "${cid}" get "identity-provider/instances/${a}/mappers" -r "${KEYCLOAK_REALM}" \
+            > "${KC_IDP_DIR}/${a}.mappers.json" 2>/dev/null || true
+        cnt=$(grep -c '"identityProviderAlias"' "${KC_IDP_DIR}/${a}.mappers.json" 2>/dev/null) || cnt=0
+        log "  identity provider ${a}: мапперов ${cnt}"
+        [ "${cnt}" -gt 0 ] || warn "у провайдера ${a} нет мапперов - вход через SSO может не давать доступов"
+    done
 }
 
 # Соответствие "имя docker secret -> clientId". Определяется по фактическим
@@ -759,6 +801,8 @@ docker exec -i "${keycloak_container_id}" test -s /opt/keycloak/visiology-realm.
     || die "kc.sh export не создал /opt/keycloak/visiology-realm.json (запустите с -d и посмотрите вывод)"
 docker cp "${keycloak_container_id}":/opt/keycloak/visiology-realm.json "${REALM_FILE}"
 grep -q '"realm"' "${REALM_FILE}" || die "visiology-realm.json не похож на экспорт realm"
+
+dump_keycloak_idp "${keycloak_container_id}"
 
 # Секреты читаются через docker exec -i, без -t.
 m2m_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_M2M_SECRET)
