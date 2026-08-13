@@ -1331,6 +1331,12 @@ fi
 
 archive_name="$(hostname)-backup-v${VERSION}-$(date '+%Y-%m-%d-%H-%M-%S').tar.gz"
 backup_file_dir=$(dirname "$(readlink -f "${BACKUP_DIR}/${archive_name}")")
+# Право на вход в каталоги выставляется до упаковки, а не после распаковки.
+# Восстановление 3.16 делает это само (chmod -R ug+X), в более ранних сборках
+# такого шага нет, и архив с закрытыми каталогами там не прочитается.
+# Заглавная X трогает только каталоги, файлы исполняемыми не становятся.
+sudo chmod -R ug+X "${MAIN_BACKUP_DIR}"
+
 log "упаковка (${COMPRESSOR%% *})..."
 sudo tar -cf - -C "${backup_file_dir}" backup | ${COMPRESSOR} > "${backup_file_dir}/${archive_name}"
 NOTIFY_ARCHIVE="${backup_file_dir}/${archive_name}"
