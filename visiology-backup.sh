@@ -24,13 +24,16 @@ KC_KEEP_SECRETS=0
 ALLOW_PARTIAL_CH=0
 CH_ONLY_NODE=""
 CH_ONLY=0
+# Копировать каталог данных ClickHouse целиком, а не только базу CH_DB
+FULL_CH_COPY=0
 
 # Парсинг аргументов: -d/--debug (трассировка), -h/--help
 while [ "$1" != "" ]; do
     case "$1" in
         "-?" | "-h" | "--help")
             echo "Usage: $0 [-d|--debug] [--ch-node ИМЯ] [--allow-partial-clickhouse]"
-            echo "          [--keep-keycloak-secrets] [--ch-only] [-h|--help]"
+            echo "          [--keep-keycloak-secrets] [--full-ch-copy] [--ch-only]"
+            echo "          [-h|--help]"
             echo "  -d, --debug   режим отладки (трассировка команд, показ ошибок)"
             echo "  -h, --help    эта справка"
             echo
@@ -45,6 +48,12 @@ while [ "$1" != "" ]; do
             echo "                \"$0 --ch-only --ch-node ИМЯ\", затем каталоги"
             echo "                backup/clickhouse/ИМЯ переносятся к основному"
             echo "                хосту и пакуются вместе с ним."
+            echo "  --full-ch-copy"
+            echo "                копировать каталог данных ClickHouse целиком."
+            echo "                По умолчанию копируются только каталоги базы,"
+            echo "                которая выгружается; остальное - системные"
+            echo "                журналы сервера, они в бэкап не входят и обычно"
+            echo "                занимают в разы больше самих данных."
             echo "  --allow-partial-clickhouse"
             echo "                не прерывать бэкап, если часть нод CH недоступна"
             echo "                или часть таблиц не выгрузилась (словари,"
@@ -78,6 +87,9 @@ while [ "$1" != "" ]; do
             ;;
         "--ch-only")
             CH_ONLY=1
+            ;;
+        "--full-ch-copy")
+            FULL_CH_COPY=1
             ;;
         "--ch-node")
             shift
@@ -399,6 +411,29 @@ _remove_snapshot() {
     return 1
 }
 
+# Запрос к работающему серверу ClickHouse. Учётные данные читает сам контейнер
+# из /run/secrets, в argv они не попадают.
+#   $1 - идентификатор контейнера, $2 - запрос
+_ch_live_query() {
+    local cid="$1" q="$2"
+    docker exec -i "${cid}" sh -c 'U=$(cat /run/secrets/CLICKHOUSE_USER 2>/dev/null); P=$(cat /run/secrets/CLICKHOUSE_PASSWORD 2>/dev/null); if [ -n "$U" ]; then clickhouse-client -u "$U" --password "$P" -q "$1"; else clickhouse-client -q "$1"; fi' _ "${q}"
+}
+
+# Каталоги базы CH_DB на диске, относительно каталога данных ClickHouse.
+# Список берётся у самого сервера (system.tables.data_paths и metadata_path
+# базы), поэтому верен при любом движке базы, любой раскладке store/ и после
+# переименований. Возвращает 1, если список получить не удалось.
+ch_relative_paths() {
+    local cid="$1" out
+    out=$(_ch_live_query "${cid}" "SELECT arrayJoin(data_paths) FROM system.tables WHERE database = '${CH_DB}' UNION ALL SELECT metadata_path FROM system.databases WHERE name = '${CH_DB}' FORMAT TSVRaw" 2>/dev/null) || out=""
+    [ -n "${out}" ] || return 1
+    {
+        printf '%s\n' "${out}"
+        printf '/var/lib/clickhouse/metadata/%s.sql\n' "${CH_DB}"
+        printf '/var/lib/clickhouse/metadata/%s\n' "${CH_DB}"
+    } | sed -e 's#^/var/lib/clickhouse/##' -e 's#/$##' | grep -v '^$' | sort -u
+}
+
 # Удаление временных контейнеров CH (по одному на ноду).
 # Конвейер обёрнут в $( ... || true): при pipefail пустой вывод grep возвращает
 # 1, и голый конвейер под set -e прервал бы скрипт.
@@ -652,6 +687,23 @@ dump_clickhouse() {
 
     [ ${#locals[@]} -gt 0 ] || die "нет ни одной локальной ноды ClickHouse для выгрузки"
 
+    # Список каталогов базы запрашивается у РАБОТАЮЩЕГО сервера, до снапшота.
+    # Пустой файл означает "копировать том целиком".
+    local ch_paths_file live_cid first_host
+    ch_paths_file=$(mktemp)
+    if [ "${FULL_CH_COPY}" = "1" ]; then
+        log "  --full-ch-copy: копирую том целиком"
+    else
+        IFS='|' read -r first_host _ <<< "${locals[0]}"
+        live_cid=$(resolve_container "${PROJECT}_${first_host}") || live_cid=""
+        if [ -n "${live_cid}" ] && ch_relative_paths "${live_cid}" > "${ch_paths_file}" 2>/dev/null; then
+            log "  каталогов базы ${CH_DB} к копированию: $(wc -l < "${ch_paths_file}")"
+        else
+            : > "${ch_paths_file}"
+            warn "не удалось получить список каталогов базы у ${PROJECT}_${first_host}, копирую том целиком"
+        fi
+    fi
+
     log "ClickHouse: снапшот и выгрузка (${#locals[@]} нод)..."
 
     _rm_temp_ch_containers
@@ -688,8 +740,23 @@ dump_clickhouse() {
         local src="${SNAP_MNT}/var/lib/docker/volumes/${vol}/_data"
         [ -d "${src}" ] || die "${chost}: в снапшоте нет данных тома ${vol}"
         sudo mkdir -p "${CH_COPY_DIR}/${chost}"
+
+        # Копируем только каталоги базы CH_DB, а не весь том: остальное - это
+        # системные журналы сервера (query_log, trace_log и прочие), которые в
+        # выгрузку не входят, а по объёму обычно многократно превосходят данные.
+        # Временному серверу они не нужны, свою system он создаёт при старте.
+        if [ -s "${ch_paths_file}" ]; then
+            if sudo tar -C "${src}" --files-from="${ch_paths_file}" --ignore-failed-read -cf - 2>/dev/null \
+                 | sudo tar -C "${CH_COPY_DIR}/${chost}" -xf -; then
+                log "  ${chost}: копия готова, только база ${CH_DB} ($(sudo du -sh "${CH_COPY_DIR}/${chost}" 2>/dev/null | cut -f1))"
+                continue
+            fi
+            warn "${chost}: копирование по списку не удалось, копирую том целиком"
+            sudo rm -rf "${CH_COPY_DIR:?}/${chost}"
+            sudo mkdir -p "${CH_COPY_DIR}/${chost}"
+        fi
         sudo cp -a "${src}/." "${CH_COPY_DIR}/${chost}/"
-        log "  ${chost}: копия готова ($(sudo du -sh "${CH_COPY_DIR}/${chost}" 2>/dev/null | cut -f1))"
+        log "  ${chost}: копия готова, том целиком ($(sudo du -sh "${CH_COPY_DIR}/${chost}" 2>/dev/null | cut -f1))"
     done
 
     # Точка монтирования больше не нужна и отцепляется сразу, но в фоне: umount
@@ -734,6 +801,8 @@ XMLEOF
         # копию удаляем сразу - на многонодовой установке иначе нужен суммарный объём
         sudo rm -rf "${CH_COPY_DIR:?}/${chost}" >/dev/null 2>&1 || true
     done
+
+    rm -f "${ch_paths_file}"
 
     if [ ${#remotes[@]} -gt 0 ]; then
         local r rhost rsvc rnode
