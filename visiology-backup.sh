@@ -15,9 +15,9 @@
 # Результат - один архив <hostname>-backup-v<версия>-<дата>.tar.gz.
 # Коды возврата: 0 - успех, 1 - ошибка, 3 - прогон уже выполняется.
 #
-# По завершении отправляется отчёт по почте - тем же visiology-backup-notify.py
-# рядом со скриптом, настройки SMTP в /etc/visiology-backup.env. Письмо уходит
-# при любом исходе; если отправщика или настроек нет, прогон идёт молча.
+# По завершении отправляется отчёт по почте - при любом исходе, включая аварию и
+# отказ из-за уже идущего прогона. Адреса и параметры SMTP задаются в блоке
+# "ОТЧЁТ ПО ПОЧТЕ" ниже; пустой MAIL_TO отправку отключает.
 #
 COMMAND_LINE="$0 $*"
 error_output=/dev/null
@@ -121,12 +121,46 @@ t_start=$(date +%s)
 T_START_HUMAN=$(date '+%F %T')
 
 ########################################
-# ОТЧЁТ ПО ПОЧТЕ
+# ОТЧЁТ ПО ПОЧТЕ (правится под контур)
 ########################################
-# Письмо отправляет visiology-backup-notify.py, настройки SMTP - в NOTIFY_ENV.
-# Если отправщика или файла настроек нет, прогон идёт как обычно, молча.
-NOTIFY_SCRIPT="${SCRIPT_DIR}/visiology-backup-notify.py"
+# Пустой MAIL_TO отключает отправку. Получатели перечисляются через запятую.
+MAIL_TO=""
+MAIL_FROM="visiology-backup@$(hostname)"
+SMTP_HOST="localhost"
+SMTP_PORT="25"
+SMTP_USE_TLS="false"      # STARTTLS, если релей его требует
+SMTP_SKIP_VERIFY="false"  # не проверять сертификат релея (самоподписанный)
+SMTP_USER=""
+SMTP_PASSWORD=""
+
+# Хранить пароль в скрипте не обязательно: если файл ниже существует, значения
+# из него перекрывают заданные выше. Формат KEY=VALUE, строки с # - комментарий.
+# Права - 600.
+#
+# Файл разбирается построчно, а не через source: значение с пробелом (например
+# список получателей через ", ") bash попытался бы выполнить как команду, а сам
+# файл настроек получил бы право запускать что угодно. Ключи вне списка ниже
+# игнорируются, чтобы файл не переопределял настройки самого бэкапа.
 NOTIFY_ENV="${NOTIFY_ENV:-/etc/visiology-backup.env}"
+if [ -r "${NOTIFY_ENV}" ]; then
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        _line="${_line%$'\r'}"
+        case "${_line}" in ''|'#'*) continue ;; esac
+        _key="${_line%%=*}"
+        _val="${_line#*=}"
+        case "${_key}" in
+            MAIL_TO|MAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_SKIP_VERIFY|SMTP_USER|SMTP_PASSWORD) ;;
+            *) continue ;;
+        esac
+        # Кавычки вокруг значения снимаются, как это делал бы source.
+        case "${_val}" in
+            \"*\") _val="${_val#\"}"; _val="${_val%\"}" ;;
+            \'*\') _val="${_val#\'}"; _val="${_val%\'}" ;;
+        esac
+        printf -v "${_key}" '%s' "${_val}"
+    done < "${NOTIFY_ENV}"
+    unset _line _key _val
+fi
 
 # Путь к журналу нужен письму, чтобы приложить последние строки при аварии. Под
 # cron поток вывода перенаправлен в файл, и его имя видно через /proc. Дескриптор
@@ -140,18 +174,211 @@ exec 8>&-
 NOTIFY_ARCHIVE=""
 NOTIFY_ARCHIVE_SIZE=""
 
-# Отправка отчёта. $1 - статус (ok|fail|running), далее - аргументы отправщика.
-# Ошибка отправки не должна влиять на исход бэкапа, поэтому результат гасится.
+# Отправка отчёта. $1 - статус (ok|fail|running), далее - параметры прогона.
+#
+# Письмо собирает и отправляет встроенный обработчик на python3: разбор SMTP,
+# STARTTLS и заголовки с кириллицей на чистом bash пришлось бы писать вручную,
+# а python3 есть в любой поддерживаемой Ubuntu. Внешние пакеты не нужны -
+# используется только стандартная библиотека.
+#
+# Настройки передаются переменными окружения, а не аргументами: пароль не должен
+# попадать в argv, видимый через ps. Ошибка отправки не влияет на исход бэкапа.
 notify() {
     local status="$1"; shift
-    [ -f "${NOTIFY_SCRIPT}" ] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
+    [ -n "${MAIL_TO}" ] || return 0
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "$(date '+%F %T') [visiology-backup] ВНИМАНИЕ: python3 не найден, отчёт не отправлен" >&2
+        return 0
+    fi
 
-    local args=(--env "${NOTIFY_ENV}" --status "${status}")
+    local args=(--status "${status}")
     if [ -n "${LOG_PATH}" ]; then
         args+=(--log-file "${LOG_PATH}")
     fi
-    timeout 90 python3 "${NOTIFY_SCRIPT}" "${args[@]}" "$@" || true
+
+    (
+        export MAIL_TO MAIL_FROM SMTP_HOST SMTP_PORT SMTP_USE_TLS SMTP_SKIP_VERIFY SMTP_USER SMTP_PASSWORD
+        timeout 90 python3 - "${args[@]}" "$@" <<'NOTIFY_PY'
+"""Отчёт о прогоне visiology-backup.sh. Параметры - аргументами, SMTP - из окружения."""
+import argparse
+import logging
+import os
+import smtplib
+import socket
+import ssl
+import sys
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+LOG_TAIL_LINES = 40
+SMTP_TIMEOUT = 20
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [visiology-backup] %(levelname)s %(message)s")
+log = logging.getLogger("notify")
+
+
+def getenv_str(key: str, default: str = "") -> str:
+    value = os.getenv(key)
+    if value is None or not str(value).strip():
+        return default
+    return str(value).strip()
+
+
+def get_host_ip() -> str:
+    """IP основного исходящего интерфейса; трафик при этом не идёт."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return "unknown"
+
+
+HOSTNAME = os.uname().nodename
+HOST_IP = get_host_ip()
+
+
+def send_email(subject: str, body: str) -> bool:
+    mail_to = [a.strip() for a in getenv_str("MAIL_TO").split(",") if a.strip()]
+    if not mail_to:
+        log.warning("MAIL_TO пуст - отправка пропущена.")
+        return False
+
+    mail_from = getenv_str("MAIL_FROM", f"visiology-backup@{HOSTNAME}")
+    smtp_user = getenv_str("SMTP_USER")
+    smtp_password = getenv_str("SMTP_PASSWORD")
+
+    msg = MIMEMultipart()
+    msg["From"] = mail_from
+    msg["To"] = ", ".join(mail_to)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    context = ssl.create_default_context()
+    if getenv_str("SMTP_SKIP_VERIFY", "false").lower() in ("1", "true", "yes"):
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+    try:
+        server = smtplib.SMTP(getenv_str("SMTP_HOST", "localhost"),
+                              int(getenv_str("SMTP_PORT", "25")), timeout=SMTP_TIMEOUT)
+        if getenv_str("SMTP_USE_TLS", "false").lower() in ("1", "true", "yes"):
+            server.starttls(context=context)
+        if smtp_user and smtp_password:
+            server.login(smtp_user, smtp_password)
+        server.sendmail(mail_from, mail_to, msg.as_string())
+        server.quit()
+        log.info(f"Отчёт отправлен: {mail_to}")
+        return True
+    except Exception as e:
+        log.error(f"Не удалось отправить отчёт: {e}")
+        return False
+
+
+def read_lines(path: str, tail: int = 0) -> list:
+    """Строки файла; при tail > 0 - только последние. Ошибки чтения гасятся."""
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = [line.rstrip("\n") for line in fh]
+    except OSError as e:
+        log.warning(f"Не удалось прочитать {path}: {e}")
+        return []
+    return lines[-tail:] if tail else lines
+
+
+def build_subject(args, notes_count: int) -> str:
+    head = f"[Visiology backup] {HOSTNAME} ({HOST_IP})"
+    if args.status == "running":
+        return f"{head}: ПРОПУЩЕН - предыдущий прогон ещё идёт"
+    if args.status == "fail":
+        return f"{head}: ОШИБКА (код {args.rc})"
+    size = f", {args.archive_size}" if args.archive_size else ""
+    notes = f", замечаний: {notes_count}" if notes_count else ""
+    return f"{head}: успешно за ~{args.elapsed_min} мин{size}{notes}"
+
+
+def build_body(args, notes: list, log_tail: list) -> str:
+    if args.status == "ok":
+        result = "успешно"
+        intro = "Резервное копирование Visiology завершено."
+    elif args.status == "fail":
+        result = f"ОШИБКА (код возврата {args.rc})"
+        intro = "ВНИМАНИЕ! Резервное копирование Visiology завершилось с ошибкой."
+    else:
+        result = "пропущен"
+        intro = ("Запуск резервного копирования пропущен: предыдущий прогон ещё выполняется. "
+                 "Проверьте, не завис ли он.")
+
+    lines = [intro, "",
+             f"Сервер:        {HOSTNAME}",
+             f"IP-адрес:      {HOST_IP}",
+             f"Результат:     {result}"]
+    if args.mode:
+        lines.append(f"Режим:         {args.mode}")
+    if args.started:
+        lines.append(f"Начало:        {args.started}")
+    lines.append(f"Завершение:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if args.status != "running":
+        lines.append(f"Длительность:  ~{args.elapsed_min} мин")
+    if args.archive:
+        size = f" ({args.archive_size})" if args.archive_size else ""
+        lines.append(f"Архив:         {args.archive}{size}")
+    elif args.status == "fail":
+        lines.append("Архив:         не собран")
+    if args.log_file:
+        lines.append(f"Журнал:        {args.log_file}")
+
+    if notes:
+        lines += ["", f"Замечания ({len(notes)}):", ""]
+        lines += [f"   {note}" for note in notes]
+
+    if log_tail:
+        lines += ["", f"Последние строки журнала ({len(log_tail)}):", ""]
+        lines += [f"   {line}" for line in log_tail]
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Отчёт о прогоне visiology-backup.sh")
+    parser.add_argument("--status", required=True, choices=("ok", "fail", "running"))
+    parser.add_argument("--rc", type=int, default=0, help="код возврата бэкапа")
+    parser.add_argument("--started", default="", help="время старта прогона")
+    parser.add_argument("--elapsed-min", default="0", help="длительность в минутах")
+    parser.add_argument("--archive", default="", help="путь к собранному архиву")
+    parser.add_argument("--archive-size", default="", help="размер архива")
+    parser.add_argument("--mode", default="", help="особый режим прогона")
+    parser.add_argument("--notes-file", default="", help="файл с замечаниями, по строке")
+    parser.add_argument("--log-file", default="", help="журнал прогона")
+    args = parser.parse_args()
+
+    notes = [line for line in read_lines(args.notes_file) if line.strip()]
+    # Хвост журнала прикладывается только к аварийному письму: при успехе он
+    # ничего не добавляет, а объём письма увеличивает.
+    log_tail = read_lines(args.log_file, LOG_TAIL_LINES) if args.status == "fail" else []
+
+    send_email(build_subject(args, len(notes)), build_body(args, notes, log_tail))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        log.exception(f"Сбой при отправке отчёта: {e}")
+        sys.exit(0)
+NOTIFY_PY
+    ) || true
 }
 
 # Защита от параллельных запусков: прогон длится часами, и наложение расписания
