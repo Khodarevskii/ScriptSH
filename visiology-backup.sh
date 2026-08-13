@@ -24,13 +24,16 @@ KC_KEEP_SECRETS=0
 ALLOW_PARTIAL_CH=0
 CH_ONLY_NODE=""
 CH_ONLY=0
+# Оставить каталог backup/ после упаковки (по умолчанию он очищается)
+KEEP_BACKUP_DIR=0
 
 # Парсинг аргументов: -d/--debug (трассировка), -h/--help
 while [ "$1" != "" ]; do
     case "$1" in
         "-?" | "-h" | "--help")
             echo "Usage: $0 [-d|--debug] [--ch-node ИМЯ] [--allow-partial-clickhouse]"
-            echo "          [--keep-keycloak-secrets] [--ch-only] [-h|--help]"
+            echo "          [--keep-keycloak-secrets] [--keep-backup-dir] [--ch-only]"
+            echo "          [-h|--help]"
             echo "  -d, --debug   режим отладки (трассировка команд, показ ошибок)"
             echo "  -h, --help    эта справка"
             echo
@@ -45,6 +48,10 @@ while [ "$1" != "" ]; do
             echo "                \"$0 --ch-only --ch-node ИМЯ\", затем каталоги"
             echo "                backup/clickhouse/ИМЯ переносятся к основному"
             echo "                хосту и пакуются вместе с ним."
+            echo "  --keep-backup-dir"
+            echo "                не очищать backup/ после упаковки. По умолчанию"
+            echo "                каталог очищается: его содержимое повторяет"
+            echo "                архив и занимает столько же места."
             echo "  --allow-partial-clickhouse"
             echo "                не прерывать бэкап, если часть нод CH недоступна"
             echo "                или часть таблиц не выгрузилась (словари,"
@@ -78,6 +85,9 @@ while [ "$1" != "" ]; do
             ;;
         "--ch-only")
             CH_ONLY=1
+            ;;
+        "--keep-backup-dir")
+            KEEP_BACKUP_DIR=1
             ;;
         "--ch-node")
             shift
@@ -902,6 +912,17 @@ backup_file_dir=$(dirname "$(readlink -f "${BACKUP_DIR}/${archive_name}")")
 log "упаковка (${COMPRESSOR%% *})..."
 sudo tar -cf - -C "${backup_file_dir}" backup | ${COMPRESSOR} > "${backup_file_dir}/${archive_name}"
 [ -s "${backup_file_dir}/${archive_name}" ] || die "архив не создан или пустой"
+
+# Содержимое backup/ полностью повторяет только что собранный архив и занимает
+# столько же места, поэтому после упаковки каталог очищается. Восстановление в
+# нём не нуждается: restore.sh распаковывает архив заново.
+if [ "${KEEP_BACKUP_DIR}" = "1" ]; then
+    log "каталог ${MAIN_BACKUP_DIR} оставлен (--keep-backup-dir)"
+else
+    freed=$(sudo du -sh "${MAIN_BACKUP_DIR}" 2>/dev/null | cut -f1) || freed=""
+    sudo rm -rf "${MAIN_BACKUP_DIR:?}"/*
+    log "каталог ${MAIN_BACKUP_DIR} очищен${freed:+, освобождено ${freed}}"
+fi
 
 if [ -f "${KC_WARN_FILE}" ]; then
     warn "секреты Keycloak нормализованы не полностью, подробности в ${KC_WARN_FILE}"
