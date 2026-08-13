@@ -15,6 +15,10 @@
 # Результат - один архив <hostname>-backup-v<версия>-<дата>.tar.gz.
 # Коды возврата: 0 - успех, 1 - ошибка, 3 - прогон уже выполняется.
 #
+# По завершении отправляется отчёт по почте - тем же visiology-backup-notify.py
+# рядом со скриптом, настройки SMTP в /etc/visiology-backup.env. Письмо уходит
+# при любом исходе; если отправщика или настроек нет, прогон идёт молча.
+#
 COMMAND_LINE="$0 $*"
 error_output=/dev/null
 
@@ -111,6 +115,45 @@ set -o pipefail
 # PATH задаётся явно: у cron он минимальный, а утилиты LVM лежат в /usr/sbin.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
+SCRIPT_DIR=$( dirname -- "$( readlink -f -- "$0")")
+
+t_start=$(date +%s)
+T_START_HUMAN=$(date '+%F %T')
+
+########################################
+# ОТЧЁТ ПО ПОЧТЕ
+########################################
+# Письмо отправляет visiology-backup-notify.py, настройки SMTP - в NOTIFY_ENV.
+# Если отправщика или файла настроек нет, прогон идёт как обычно, молча.
+NOTIFY_SCRIPT="${SCRIPT_DIR}/visiology-backup-notify.py"
+NOTIFY_ENV="${NOTIFY_ENV:-/etc/visiology-backup.env}"
+
+# Путь к журналу нужен письму, чтобы приложить последние строки при аварии. Под
+# cron поток вывода перенаправлен в файл, и его имя видно через /proc. Дескриптор
+# сначала дублируется: внутри подстановки команд fd 1 - это её труба, а не файл.
+exec 8>&1
+LOG_PATH=$(readlink -f /proc/self/fd/8 2>/dev/null) || LOG_PATH=""
+exec 8>&-
+[ -f "${LOG_PATH}" ] || LOG_PATH=""
+
+# Данные для письма, известные только к концу прогона.
+NOTIFY_ARCHIVE=""
+NOTIFY_ARCHIVE_SIZE=""
+
+# Отправка отчёта. $1 - статус (ok|fail|running), далее - аргументы отправщика.
+# Ошибка отправки не должна влиять на исход бэкапа, поэтому результат гасится.
+notify() {
+    local status="$1"; shift
+    [ -f "${NOTIFY_SCRIPT}" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    local args=(--env "${NOTIFY_ENV}" --status "${status}")
+    if [ -n "${LOG_PATH}" ]; then
+        args+=(--log-file "${LOG_PATH}")
+    fi
+    timeout 90 python3 "${NOTIFY_SCRIPT}" "${args[@]}" "$@" || true
+}
+
 # Защита от параллельных запусков: прогон длится часами, и наложение расписания
 # привело бы к попытке создать снапшот с уже занятым именем.
 LOCK_DIR=/var/lock
@@ -119,10 +162,15 @@ LOCK_FILE="${LOCK_DIR}/visiology-backup.lock"
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
     echo "$(date '+%F %T') [visiology-backup] предыдущий бэкап ещё выполняется (${LOCK_FILE}), выходим" >&2
+    notify running --rc 3 --started "${T_START_HUMAN}"
     exit 3
 fi
 
-SCRIPT_DIR=$( dirname -- "$( readlink -f -- "$0")")
+# Временный обработчик на время подготовки: до установки основного (cleanup)
+# скрипт может упасть на чтении конфигов, и такой отказ тоже должен дойти
+# письмом, иначе под cron он останется незамеченным.
+trap 'rc=$?; [ "${rc}" -eq 0 ] || notify fail --rc "${rc}" --started "${T_START_HUMAN}"; exit "${rc}"' EXIT
+
 pushd "${SCRIPT_DIR}" >/dev/null
 
 source config.env
@@ -182,9 +230,22 @@ KC_MAP_FILE="${MAIN_BACKUP_DIR}/keycloak-clients.map"
 KC_WARN_FILE="${MAIN_BACKUP_DIR}/KEYCLOAK-SECRETS-README.txt"
 
 LOG_TAG="[visiology-backup]"
+
+# Замечания и причина аварии дублируются в файл: из него итоговое письмо
+# собирает раздел "Замечания". Через файл, а не переменную, потому что die
+# вызывается в том числе внутри подстановок команд, где присваивание пропадёт.
+NOTIFY_NOTES=$(mktemp /tmp/visiology-backup-notes.XXXXXX) || NOTIFY_NOTES=/dev/null
+
 log() { echo "$(date '+%F %T') ${LOG_TAG} $*"; }
-warn() { echo "$(date '+%F %T') ${LOG_TAG} ВНИМАНИЕ: $*" >&2; }
-die() { echo "$(date '+%F %T') ${LOG_TAG} ОШИБКА: $*" >&2; exit 1; }
+warn() {
+    echo "$(date '+%F %T') ${LOG_TAG} ВНИМАНИЕ: $*" >&2
+    printf 'ВНИМАНИЕ: %s\n' "$*" >> "${NOTIFY_NOTES}" 2>/dev/null || true
+}
+die() {
+    echo "$(date '+%F %T') ${LOG_TAG} ОШИБКА: $*" >&2
+    printf 'ОШИБКА: %s\n' "$*" >> "${NOTIFY_NOTES}" 2>/dev/null || true
+    exit 1
+}
 
 CH_STARTED=0
 SNAP_MOUNTED=0
@@ -504,6 +565,30 @@ cleanup() {
     if [ "${rc}" -ne 0 ]; then
         log "завершено с ошибкой (код ${rc})."
     fi
+
+    # Письмо уходит последним: к этому моменту известны и код возврата, и
+    # результат уборки - предупреждение об оставшемся снапшоте тоже попадёт в
+    # отчёт.
+    local nargs=(--rc "${rc}"
+                 --started "${T_START_HUMAN}"
+                 --elapsed-min "$(( ( $(date +%s) - t_start ) / 60 ))"
+                 --notes-file "${NOTIFY_NOTES}")
+    if [ -n "${NOTIFY_ARCHIVE}" ]; then
+        nargs+=(--archive "${NOTIFY_ARCHIVE}")
+    fi
+    if [ -n "${NOTIFY_ARCHIVE_SIZE}" ]; then
+        nargs+=(--archive-size "${NOTIFY_ARCHIVE_SIZE}")
+    fi
+    if [ "${CH_ONLY}" = "1" ]; then
+        nargs+=(--mode "только ClickHouse (--ch-only)")
+    fi
+    if [ "${rc}" -eq 0 ]; then
+        notify ok "${nargs[@]}"
+    else
+        notify fail "${nargs[@]}"
+    fi
+    rm -f "${NOTIFY_NOTES}" >/dev/null 2>&1 || true
+
     exit "${rc}"
 }
 
@@ -851,7 +936,6 @@ XMLEOF
 ########################################
 # MAIN
 ########################################
-t_start=$(date +%s)
 log "=== СТАРТ полного бэкапа Visiology ==="
 
 if [ "${CH_ONLY}" = "1" ]; then
@@ -992,6 +1076,8 @@ archive_name="$(hostname)-backup-v${VERSION}-$(date '+%Y-%m-%d-%H-%M-%S').tar.gz
 backup_file_dir=$(dirname "$(readlink -f "${BACKUP_DIR}/${archive_name}")")
 log "упаковка (${COMPRESSOR%% *})..."
 sudo tar -cf - -C "${backup_file_dir}" backup | ${COMPRESSOR} > "${backup_file_dir}/${archive_name}"
+NOTIFY_ARCHIVE="${backup_file_dir}/${archive_name}"
+NOTIFY_ARCHIVE_SIZE=$(sudo du -h "${NOTIFY_ARCHIVE}" 2>/dev/null | cut -f1) || NOTIFY_ARCHIVE_SIZE=""
 # Содержимое backup/ полностью повторяет собранный архив и занимает столько же
 # места. Восстановление в нём не нуждается: restore.sh распаковывает архив
 # заново. При аварии до этой точки каталог остаётся нетронутым для разбора.
@@ -1007,4 +1093,4 @@ fi
 t_end=$(date +%s)
 elapsed=$(( (t_end - t_start) / 60 ))
 log "=== ГОТОВО за ~${elapsed} мин ==="
-log "Архив: ${backup_file_dir}/${archive_name} ($(sudo du -h "${backup_file_dir}/${archive_name}" 2>/dev/null | cut -f1))"
+log "Архив: ${NOTIFY_ARCHIVE} (${NOTIFY_ARCHIVE_SIZE:-размер не определён})"
