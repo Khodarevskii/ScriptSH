@@ -411,6 +411,27 @@ _remove_snapshot() {
     return 1
 }
 
+# Подготовка каталога копии к запуску временного сервера.
+# При выборочном копировании в копию попадают только каталоги базы, а служебные
+# подкаталоги сервер создаёт сам - но не может, если корень копии принадлежит
+# root, а сам он работает под 101:101. Поэтому создаём их заранее и отдаём
+# владение. Содержимое копии владельца не меняет: tar сохраняет исходного.
+_prepare_ch_copy_dirs() {
+    local dst="$1" d
+    for d in tmp user_files format_schemas access flags metadata_dropped preprocessed_configs data metadata store; do
+        sudo mkdir -p "${dst}/${d}"
+        sudo chown 101:101 "${dst}/${d}"
+    done
+    sudo chown 101:101 "${dst}"
+
+    # Каталоги store/<префикс> в списке не значатся, tar создаёт их от root.
+    # Сервер пишет в них, когда заводит собственную базу system, поэтому владение
+    # отдаём и здесь. Каталогов не больше 256, обход дешёвый.
+    if [ -d "${dst}/store" ]; then
+        sudo find "${dst}/store" -mindepth 1 -maxdepth 1 -type d -exec chown 101:101 {} +
+    fi
+}
+
 # Запрос к работающему серверу ClickHouse. Учётные данные читает сам контейнер
 # из /run/secrets, в argv они не попадают.
 #   $1 - идентификатор контейнера, $2 - запрос
@@ -463,8 +484,7 @@ cleanup() {
     # может уйти в непрерываемый сон, где ограничение по времени не работает,
     # поэтому команды ручной уборки выводятся до попытки, а не после.
     if [ "${SNAP_CREATED}" = "1" ] || sudo timeout 15 lvs "${VG_NAME}/${SNAP_NAME}" >/dev/null 2>&1; then
-        log "  удаляю снапшот. Архив к этому моменту уже собран; при зависании"
-        log "  снапшот снимается вручную:"
+        log "  удаляю снапшот. При зависании его можно снять вручную:"
         log "    sudo umount -l ${SNAP_MNT}; sudo lvremove -y ${VG_NAME}/${SNAP_NAME}"
 
         if [ "${SNAP_MOUNTED}" = "1" ] || timeout 10 mountpoint -q "${SNAP_MNT}" 2>/dev/null; then
@@ -748,6 +768,7 @@ dump_clickhouse() {
         if [ -s "${ch_paths_file}" ]; then
             if sudo tar -C "${src}" --files-from="${ch_paths_file}" --ignore-failed-read -cf - 2>/dev/null \
                  | sudo tar -C "${CH_COPY_DIR}/${chost}" -xf -; then
+                _prepare_ch_copy_dirs "${CH_COPY_DIR}/${chost}"
                 log "  ${chost}: копия готова, только база ${CH_DB} ($(sudo du -sh "${CH_COPY_DIR}/${chost}" 2>/dev/null | cut -f1))"
                 continue
             fi
@@ -756,6 +777,7 @@ dump_clickhouse() {
             sudo mkdir -p "${CH_COPY_DIR}/${chost}"
         fi
         sudo cp -a "${src}/." "${CH_COPY_DIR}/${chost}/"
+        _prepare_ch_copy_dirs "${CH_COPY_DIR}/${chost}"
         log "  ${chost}: копия готова, том целиком ($(sudo du -sh "${CH_COPY_DIR}/${chost}" 2>/dev/null | cut -f1))"
     done
 
