@@ -128,7 +128,11 @@ MAIL_TO=""
 MAIL_FROM="visiology-backup@$(hostname)"
 SMTP_HOST="localhost"
 SMTP_PORT="25"
-SMTP_USE_TLS="false"      # STARTTLS, если релей его требует
+# Шифрование. Порт 25 и 587 - обычно STARTTLS, порт 465 - SSL с первого байта.
+# Режим должен соответствовать порту: на 465 без SMTP_USE_SSL соединение просто
+# висит до таймаута, потому что релей ждёт TLS, а клиент - текстовое приветствие.
+SMTP_USE_TLS="false"      # STARTTLS после подключения (порт 25/587)
+SMTP_USE_SSL="false"      # TLS сразу при подключении (порт 465)
 SMTP_SKIP_VERIFY="false"  # не проверять сертификат релея (самоподписанный)
 SMTP_USER=""
 SMTP_PASSWORD=""
@@ -149,7 +153,7 @@ if [ -r "${NOTIFY_ENV}" ]; then
         _key="${_line%%=*}"
         _val="${_line#*=}"
         case "${_key}" in
-            MAIL_TO|MAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_SKIP_VERIFY|SMTP_USER|SMTP_PASSWORD) ;;
+            MAIL_TO|MAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_USE_SSL|SMTP_SKIP_VERIFY|SMTP_USER|SMTP_PASSWORD) ;;
             *) continue ;;
         esac
         # Кавычки вокруг значения снимаются, как это делал бы source.
@@ -197,7 +201,7 @@ notify() {
     fi
 
     (
-        export MAIL_TO MAIL_FROM SMTP_HOST SMTP_PORT SMTP_USE_TLS SMTP_SKIP_VERIFY SMTP_USER SMTP_PASSWORD
+        export MAIL_TO MAIL_FROM SMTP_HOST SMTP_PORT SMTP_USE_TLS SMTP_USE_SSL SMTP_SKIP_VERIFY SMTP_USER SMTP_PASSWORD
         timeout 90 python3 - "${args[@]}" "$@" <<'NOTIFY_PY'
 """Отчёт о прогоне visiology-backup.sh. Параметры - аргументами, SMTP - из окружения."""
 import argparse
@@ -223,6 +227,10 @@ def getenv_str(key: str, default: str = "") -> str:
     if value is None or not str(value).strip():
         return default
     return str(value).strip()
+
+
+def is_yes(key: str) -> bool:
+    return getenv_str(key, "false").lower() in ("1", "true", "yes")
 
 
 def get_host_ip() -> str:
@@ -263,15 +271,25 @@ def send_email(subject: str, body: str) -> bool:
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
     context = ssl.create_default_context()
-    if getenv_str("SMTP_SKIP_VERIFY", "false").lower() in ("1", "true", "yes"):
+    if is_yes("SMTP_SKIP_VERIFY"):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
+    host = getenv_str("SMTP_HOST", "localhost")
+    port = int(getenv_str("SMTP_PORT", "25"))
+    use_ssl = is_yes("SMTP_USE_SSL")
+    use_tls = is_yes("SMTP_USE_TLS")
+    mode = "SSL" if use_ssl else ("STARTTLS" if use_tls else "без шифрования")
+
     try:
-        server = smtplib.SMTP(getenv_str("SMTP_HOST", "localhost"),
-                              int(getenv_str("SMTP_PORT", "25")), timeout=SMTP_TIMEOUT)
-        if getenv_str("SMTP_USE_TLS", "false").lower() in ("1", "true", "yes"):
-            server.starttls(context=context)
+        # На порту 465 TLS начинается с первого байта, приветствия в открытом
+        # виде там нет - нужен SMTP_SSL, обычный SMTP на нём ждёт до таймаута.
+        if use_ssl:
+            server = smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT, context=context)
+        else:
+            server = smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT)
+            if use_tls:
+                server.starttls(context=context)
         if smtp_user and smtp_password:
             server.login(smtp_user, smtp_password)
         server.sendmail(mail_from, mail_to, msg.as_string())
@@ -279,7 +297,7 @@ def send_email(subject: str, body: str) -> bool:
         log.info(f"Отчёт отправлен: {mail_to}")
         return True
     except Exception as e:
-        log.error(f"Не удалось отправить отчёт: {e}")
+        log.error(f"Не удалось отправить отчёт через {host}:{port} ({mode}): {e}")
         return False
 
 
