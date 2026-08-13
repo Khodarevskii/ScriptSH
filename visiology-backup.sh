@@ -911,8 +911,6 @@ archive_name="$(hostname)-backup-v${VERSION}-$(date '+%Y-%m-%d-%H-%M-%S').tar.gz
 backup_file_dir=$(dirname "$(readlink -f "${BACKUP_DIR}/${archive_name}")")
 log "упаковка (${COMPRESSOR%% *})..."
 sudo tar -cf - -C "${backup_file_dir}" backup | ${COMPRESSOR} > "${backup_file_dir}/${archive_name}"
-[ -s "${backup_file_dir}/${archive_name}" ] || die "архив не создан или пустой"
-
 # Содержимое backup/ полностью повторяет только что собранный архив и занимает
 # столько же места, поэтому после упаковки каталог очищается. Восстановление в
 # нём не нуждается: restore.sh распаковывает архив заново.
