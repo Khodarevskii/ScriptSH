@@ -28,13 +28,15 @@ CH_ONLY_NODE=""
 CH_ONLY=0
 # Копировать каталог данных ClickHouse целиком, а не только базу CH_DB
 FULL_CH_COPY=0
+# Отправить проверочное письмо и выйти, не запуская бэкап
+TEST_MAIL=0
 
 # Парсинг аргументов: -d/--debug (трассировка), -h/--help
 while [ "$1" != "" ]; do
     case "$1" in
         "-?" | "-h" | "--help")
             echo "Usage: $0 [-d|--debug] [--ch-node ИМЯ] [--allow-partial-clickhouse]"
-            echo "          [--full-ch-copy] [--ch-only] [-h|--help]"
+            echo "          [--full-ch-copy] [--ch-only] [--test-mail] [-h|--help]"
             echo "  -d, --debug   режим отладки (трассировка команд, показ ошибок)"
             echo "  -h, --help    эта справка"
             echo
@@ -49,6 +51,8 @@ while [ "$1" != "" ]; do
             echo "                \"$0 --ch-only --ch-node ИМЯ\", затем каталоги"
             echo "                backup/clickhouse/ИМЯ переносятся к основному"
             echo "                хосту и пакуются вместе с ним."
+            echo "  --test-mail   отправить проверочное письмо и выйти. Бэкап не"
+            echo "                запускается, данные не трогаются."
             echo "  --full-ch-copy"
             echo "                копировать каталог данных ClickHouse целиком."
             echo "                По умолчанию копируются только каталоги базы,"
@@ -83,6 +87,9 @@ while [ "$1" != "" ]; do
             ;;
         "--full-ch-copy")
             FULL_CH_COPY=1
+            ;;
+        "--test-mail")
+            TEST_MAIL=1
             ;;
         "--ch-node")
             shift
@@ -307,9 +314,14 @@ def read_lines(path: str, tail: int = 0) -> list:
 
 def build_subject(args, notes_count: int) -> str:
     head = f"[Visiology backup] {HOSTNAME} ({HOST_IP})"
+    if args.status == "test":
+        return f"{head}: проверка отправки"
     if args.status == "running":
         return f"{head}: ПРОПУЩЕН - предыдущий прогон ещё идёт"
     if args.status == "fail":
+        # Нулевой код при неуспехе означает обрыв до упаковки, а не ошибку шага.
+        if args.rc == 0:
+            return f"{head}: ПРОГОН НЕ ЗАВЕРШЁН - архив не собран"
         return f"{head}: ОШИБКА (код {args.rc})"
     size = f", {args.archive_size}" if args.archive_size else ""
     notes = f", замечаний: {notes_count}" if notes_count else ""
@@ -321,8 +333,12 @@ def build_body(args, notes: list, log_tail: list) -> str:
         result = "успешно"
         intro = "Резервное копирование Visiology завершено."
     elif args.status == "fail":
-        result = f"ОШИБКА (код возврата {args.rc})"
-        intro = "ВНИМАНИЕ! Резервное копирование Visiology завершилось с ошибкой."
+        result = f"ОШИБКА (код возврата {args.rc})" if args.rc else "прогон не завершён, архив не собран"
+        intro = "ВНИМАНИЕ! Резервное копирование Visiology не выполнено."
+    elif args.status == "test":
+        result = "проверка отправки"
+        intro = ("Проверочное письмо. Отправлено ключом --test-mail, "
+                 "резервное копирование при этом не выполнялось.")
     else:
         result = "пропущен"
         intro = ("Запуск резервного копирования пропущен: предыдущий прогон ещё выполняется. "
@@ -337,7 +353,7 @@ def build_body(args, notes: list, log_tail: list) -> str:
     if args.started:
         lines.append(f"Начало:        {args.started}")
     lines.append(f"Завершение:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    if args.status != "running":
+    if args.status in ("ok", "fail"):
         lines.append(f"Длительность:  ~{args.elapsed_min} мин")
     if args.archive:
         size = f" ({args.archive_size})" if args.archive_size else ""
@@ -360,7 +376,7 @@ def build_body(args, notes: list, log_tail: list) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Отчёт о прогоне visiology-backup.sh")
-    parser.add_argument("--status", required=True, choices=("ok", "fail", "running"))
+    parser.add_argument("--status", required=True, choices=("ok", "fail", "running", "test"))
     parser.add_argument("--rc", type=int, default=0, help="код возврата бэкапа")
     parser.add_argument("--started", default="", help="время старта прогона")
     parser.add_argument("--elapsed-min", default="0", help="длительность в минутах")
@@ -389,6 +405,19 @@ if __name__ == "__main__":
 NOTIFY_PY
     ) || true
 }
+
+# Проверка почты: письмо уходит тем же путём, что и настоящий отчёт. Стоит до
+# захвата блокировки и до установки обработчика выхода - идущему прогону
+# проверка не помешает, а на диске ничего не создаётся.
+if [ "${TEST_MAIL}" = "1" ]; then
+    if [ -z "${MAIL_TO}" ]; then
+        echo "$(date '+%F %T') [visiology-backup] MAIL_TO пуст: отправка отключена" >&2
+        exit 1
+    fi
+    echo "$(date '+%F %T') [visiology-backup] проверка отправки: ${SMTP_HOST}:${SMTP_PORT} -> ${MAIL_TO}"
+    notify test --started "${T_START_HUMAN}"
+    exit 0
+fi
 
 # Защита от параллельных запусков: прогон длится часами, и наложение расписания
 # привело бы к попытке создать снапшот с уже занятым именем.
@@ -630,7 +659,12 @@ _rm_temp_ch_containers() {
 }
 
 cleanup() {
+    # Код возврата снимается первой же командой. Раньше сброс сигналов стоял в
+    # самом обработчике EXIT, перед вызовом cleanup, и $? показывал результат
+    # этого сброса, то есть всегда 0: прерванный прогон уходил в отчёт как
+    # успешный.
     local rc=$?
+    trap '' INT TERM
     log "очистка..."
 
     # Порядок важен: сначала быстрые операции, освобождающие место (копия данных
@@ -684,9 +718,15 @@ cleanup() {
     if [ "${CH_ONLY}" = "1" ]; then
         nargs+=(--mode "только ClickHouse (--ch-only)")
     fi
-    if [ "${rc}" -eq 0 ]; then
+    # Успешным прогон считается только тогда, когда архив действительно собран.
+    # Нулевой код сам по себе этого не доказывает: прогон могли прервать до
+    # упаковки. Исключение - режим --ch-only, он архив и не собирает.
+    if [ "${rc}" -eq 0 ] && { [ "${CH_ONLY}" = "1" ] || [ -s "${NOTIFY_ARCHIVE}" ]; }; then
         notify ok "${nargs[@]}"
     else
+        if [ "${rc}" -eq 0 ]; then
+            printf '%s\n' "ОШИБКА: архив не сформирован, хотя прогон завершился без кода ошибки" >> "${NOTIFY_NOTES}" 2>/dev/null || true
+        fi
         notify fail "${nargs[@]}"
     fi
     rm -f "${NOTIFY_NOTES}" >/dev/null 2>&1 || true
@@ -694,8 +734,9 @@ cleanup() {
     exit "${rc}"
 }
 
-trap 'trap "" INT TERM; cleanup' EXIT
-trap 'exit 130' INT TERM
+trap cleanup EXIT
+# Прерывание помечается в замечаниях: иначе в отчёте будет только код 130.
+trap 'printf "%s\n" "ОШИБКА: прогон прерван сигналом (Ctrl+C или kill)" >> "${NOTIFY_NOTES}" 2>/dev/null; exit 130' INT TERM
 
 # Ноды ClickHouse.
 # Имена каталогов в архиве равны значениям CLICKHOUSE_HOSTS сервиса
