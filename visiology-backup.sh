@@ -2,7 +2,7 @@
 #
 # visiology-backup.sh - полный бэкап платформы Visiology (Docker Swarm).
 #
-# Postgres, Smart Forms, MinIO, Keycloak, docker secrets и пользовательские
+# Postgres, Smart Forms, MinIO, docker secrets и пользовательские
 # настройки снимаются теми же командами, что и штатный backup.sh. ClickHouse
 # снимается отдельно: LVM-снапшот корня, копия каталога данных, временный
 # сервер CH на этой копии и выгрузка в формате Native. Это даёт согласованный
@@ -22,8 +22,6 @@
 COMMAND_LINE="$0 $*"
 error_output=/dev/null
 
-# Оставить в realm-json секреты этого стенда, не подменяя их на заглушки
-KC_KEEP_SECRETS=0
 # Разрешить неполный дамп ClickHouse и выгрузку одной конкретной ноды
 ALLOW_PARTIAL_CH=0
 CH_ONLY_NODE=""
@@ -36,8 +34,7 @@ while [ "$1" != "" ]; do
     case "$1" in
         "-?" | "-h" | "--help")
             echo "Usage: $0 [-d|--debug] [--ch-node ИМЯ] [--allow-partial-clickhouse]"
-            echo "          [--keep-keycloak-secrets] [--full-ch-copy] [--ch-only]"
-            echo "          [-h|--help]"
+            echo "          [--full-ch-copy] [--ch-only] [-h|--help]"
             echo "  -d, --debug   режим отладки (трассировка команд, показ ошибок)"
             echo "  -h, --help    эта справка"
             echo
@@ -46,7 +43,7 @@ while [ "$1" != "" ]; do
             echo "                Нужно, когда ноды CH разнесены по разным хостам:"
             echo "                скрипт снимает LVM-снапшот ЛОКАЛЬНОГО корня и"
             echo "                чужие ноды снять не может."
-            echo "  --ch-only     только ClickHouse: без postgres/keycloak/minio/"
+            echo "  --ch-only     только ClickHouse: без postgres/minio/"
             echo "                секретов, без очистки backup/ и без упаковки."
             echo "                Режим для дополнительных хостов CH: на каждом"
             echo "                \"$0 --ch-only --ch-node ИМЯ\", затем каталоги"
@@ -66,14 +63,9 @@ while [ "$1" != "" ]; do
             echo "                Архив помечается файлом CLICKHOUSE-PARTIAL.txt"
             echo "                со списком того, что не попало."
             echo
-            echo "  --keep-keycloak-secrets"
-            echo "                не подменять секреты клиентов в realm-json на"
-            echo "                заглушки. В архив попадут секреты этого стенда,"
-            echo "                и после восстановления их потребуется"
-            echo "                синхронизировать вручную."
-            echo
-            echo "Полный бэкап Visiology (postgres, smartforms, minio, keycloak,"
-            echo "секреты, custom) + консистентный ClickHouse через LVM-снапшот."
+            echo "Полный бэкап Visiology (postgres, smartforms, minio, секреты,"
+            echo "custom) + консистентный ClickHouse через LVM-снапшот."
+            echo "Keycloak не сохраняется: realm восстанавливается отдельно."
             echo
             echo "Коды возврата: 0 - успех, 1 - ошибка, 3 - предыдущий прогон"
             echo "ещё идёт, 20/127 - неверные аргументы."
@@ -82,9 +74,6 @@ while [ "$1" != "" ]; do
         "-d" | "--debug")
             set -x
             error_output=/dev/fd/1
-            ;;
-        "--keep-keycloak-secrets")
-            KC_KEEP_SECRETS=1
             ;;
         "--allow-partial-clickhouse")
             ALLOW_PARTIAL_CH=1
@@ -124,17 +113,19 @@ T_START_HUMAN=$(date '+%F %T')
 # ОТЧЁТ ПО ПОЧТЕ (правится под контур)
 ########################################
 # Пустой MAIL_TO отключает отправку. Получатели перечисляются через запятую.
-MAIL_TO=""
-MAIL_FROM="visiology-backup@$(hostname)"
-SMTP_HOST="localhost"
+MAIL_TO="user1@example.ru,user2@example.ru"
+MAIL_FROM="bi@example.ru"
+SMTP_HOST="mail.example.ru"
 SMTP_PORT="25"
 # Шифрование. Порт 25 и 587 - обычно STARTTLS, порт 465 - SSL с первого байта.
 # Режим должен соответствовать порту: на 465 без SMTP_USE_SSL соединение просто
 # висит до таймаута, потому что релей ждёт TLS, а клиент - текстовое приветствие.
 SMTP_USE_TLS="false"      # STARTTLS после подключения (порт 25/587)
 SMTP_USE_SSL="false"      # TLS сразу при подключении (порт 465)
-SMTP_SKIP_VERIFY="false"  # не проверять сертификат релея (самоподписанный)
-SMTP_USER=""
+SMTP_SKIP_VERIFY="true"   # не проверять сертификат релея (самоподписанный)
+# Пароль пуст: релей контура принимает почту без авторизации. Вход выполняется,
+# только если заданы и имя, и пароль.
+SMTP_USER="bi@example.ru"
 SMTP_PASSWORD=""
 
 # Хранить пароль в скрипте не обязательно: если файл ниже существует, значения
@@ -468,12 +459,6 @@ EXTENDED_SERVICES_PATH="extended-services"
 ENV_FILES_PATH="env-files"
 CUSTOM_CONFIGS_PATH="custom-configs"
 COMMAND_FILE="command.txt"
-KC_SERVER="http://localhost:8080/v3/keycloak"
-REALM_FILE="${MAIN_BACKUP_DIR}/visiology-realm.json"
-KC_IDP_DIR="${MAIN_BACKUP_DIR}/keycloak-idp"
-KC_MAP_FILE="${MAIN_BACKUP_DIR}/keycloak-clients.map"
-KC_WARN_FILE="${MAIN_BACKUP_DIR}/KEYCLOAK-SECRETS-README.txt"
-
 LOG_TAG="[visiology-backup]"
 
 # Замечания и причина аварии дублируются в файл: из него итоговое письмо
@@ -518,17 +503,6 @@ require_container() {
 }
 
 
-# Значение секрета для подстановки в realm-json.
-# Только -i, без -t: с псевдотерминалом docker добавляет к выводу \r.
-# tr -d дополнительно нормализует файл секрета, созданный с переводом строки.
-read_secret_value() {
-    local cid="$1" name="$2" val
-    val=$(docker exec -i "${cid}" cat "/run/secrets/${name}" 2>/dev/null | tr -d '\r\n') || true
-    [ -n "${val}" ] || die "секрет ${name} пуст или недоступен в контейнере ${cid}"
-    printf '%s' "${val}"
-}
-
-
 # Файл секрета для архива - побайтово, без нормализации: restore.sh передаёт его
 # в docker secret create, и значение должно восстановиться без изменений.
 copy_secret_file() {
@@ -536,123 +510,6 @@ copy_secret_file() {
     docker exec -i "${cid}" cat "/run/secrets/${name}" > "${out}" \
         || die "не удалось прочитать секрет ${name} из контейнера ${cid}"
     [ -s "${out}" ] || die "секрет ${name} сохранён пустым: ${out}"
-}
-
-# Экранирование для sed: BRE-шаблон и строка замены (разделитель '/').
-_esc_bre()  { printf '%s' "$1" | sed 's@[][\\.*^$/]@\\&@g'; }
-_esc_repl() { printf '%s' "$1" | sed 's@[\\&/]@\\&@g'; }
-
-# Подмена секрета в realm-json на значение-заглушку с проверкой до и после.
-# sed возвращает 0 и тогда, когда не нашёл ни одного совпадения, поэтому
-# результат проверяется явно. Расхождения не прерывают бэкап: они записываются
-# в KC_WARN_FILE и устраняются вручную после восстановления.
-replace_in_realm() {
-    local old="$1" new="$2" label="$3"
-
-    if [ -z "${old}" ] || [ -z "${new}" ]; then
-        warn "${label}: пустое значение, подмена пропущена"
-        echo "${label}: значение не получено, в realm-json осталось как есть" >> "${KC_WARN_FILE}"
-        return 0
-    fi
-
-    if ! grep -qF -- "${old}" "${REALM_FILE}"; then
-        warn "${label}: значение из /run/secrets не найдено в visiology-realm.json"
-        echo "${label}: секрет клиента в Keycloak не совпадает с docker secret этого стенда" >> "${KC_WARN_FILE}"
-        return 0
-    fi
-
-    sed -i "s/$(_esc_bre "${old}")/$(_esc_repl "${new}")/g" "${REALM_FILE}"
-
-    if ! grep -qF -- "${new}" "${REALM_FILE}" || grep -qF -- "${old}" "${REALM_FILE}"; then
-        warn "${label}: подмена применилась не полностью"
-        echo "${label}: подмена на болванку не завершилась, проверьте realm-json" >> "${KC_WARN_FILE}"
-        return 0
-    fi
-    log "  ${label}: подменён на болванку"
-}
-
-# Вызов kcadm внутри контейнера Keycloak. Учётные данные читаются из
-# /run/secrets самим контейнером и в argv не попадают.
-#   $1 - идентификатор контейнера, далее - аргументы kcadm
-_kcadm() {
-    local cid="$1"; shift
-    docker exec -i "${cid}" bash -c '
-        KCADM=/opt/keycloak/bin/kcadm.sh
-        "${KCADM}" config credentials --server "$1" --realm master \
-            --user "$(cat /run/secrets/KEYCLOAK_ADMIN)" \
-            --password "$(cat /run/secrets/KEYCLOAK_ADMIN_PASSWORD)" >/dev/null 2>&1 || exit 1
-        shift
-        "${KCADM}" "$@"
-    ' _ "${KC_SERVER}" "$@"
-}
-
-# Identity providers и их мапперы сохраняются отдельно от экспорта realm.
-# Экспорт может не содержать identityProviderMappers, а без них после
-# восстановления перестаёт работать вход через внешний SSO: провайдер есть,
-# но группы и атрибуты из токена никуда не переносятся.
-# Данные складываются в keycloak-idp/ как есть, в формате Admin API.
-dump_keycloak_idp() {
-    local cid="$1" aliases a cnt
-    aliases=$(_kcadm "${cid}" get identity-provider/instances -r "${KEYCLOAK_REALM}" \
-        --fields alias --format csv --noquotes 2>/dev/null | tr -d '\r"') || aliases=""
-    if [ -z "${aliases}" ]; then
-        log "  identity providers не настроены"
-        return 0
-    fi
-    mkdir -p "${KC_IDP_DIR}"
-    _kcadm "${cid}" get identity-provider/instances -r "${KEYCLOAK_REALM}" \
-        > "${KC_IDP_DIR}/instances.json" 2>/dev/null || true
-    for a in ${aliases}; do
-        _kcadm "${cid}" get "identity-provider/instances/${a}/mappers" -r "${KEYCLOAK_REALM}" \
-            > "${KC_IDP_DIR}/${a}.mappers.json" 2>/dev/null || true
-        cnt=$(grep -c '"identityProviderAlias"' "${KC_IDP_DIR}/${a}.mappers.json" 2>/dev/null) || cnt=0
-        log "  identity provider ${a}: мапперов ${cnt}"
-        [ "${cnt}" -gt 0 ] || warn "у провайдера ${a} нет мапперов - вход через SSO может не давать доступов"
-    done
-}
-
-# Соответствие "имя docker secret -> clientId". Определяется по фактическим
-# значениям секретов и кладётся в архив: после восстановления оно позволяет
-# синхронизировать секреты, не подбирая clientId вручную.
-# Значения передаются в python через stdin и не попадают в argv.
-write_keycloak_client_map() {
-    command -v python3 >/dev/null 2>&1 || { warn "python3 не найден, keycloak-clients.map не создан"; return 0; }
-    local py; py=$(mktemp)
-    cat > "${py}" <<'PYEOF'
-import json, sys
-realm_path, out_path = sys.argv[1], sys.argv[2]
-pairs = {}
-for line in sys.stdin:
-    line = line.rstrip("\n")
-    if not line:
-        continue
-    name, _, value = line.partition("=")
-    pairs[value] = name
-with open(realm_path, encoding="utf-8") as fh:
-    realm = json.load(fh)
-found = []
-for client in realm.get("clients", []):
-    name = pairs.get(client.get("secret"))
-    if name:
-        found.append("%s=%s" % (name, client.get("clientId", "")))
-with open(out_path, "w", encoding="utf-8") as fh:
-    fh.write("\n".join(sorted(set(found))) + ("\n" if found else ""))
-print(len(found))
-PYEOF
-    local cnt
-    cnt=$(printf '%s\n' \
-        "KEYCLOAK_M2M_SECRET=${m2m_secret}" \
-        "KEYCLOAK_GRAFANA_CLIENT_SECRET=${grafana_client_secret}" \
-        "KEYCLOAK_PUBLIC_DASHBOARD_ACCESS_SECRET=${public_dashboard_access_secret}" \
-        "KEYCLOAK_VISIOLOGY_ADMIN_REALM_SECRET=${visiology_admin_realm_secret}" \
-        | python3 "${py}" "${REALM_FILE}" "${KC_MAP_FILE}") || cnt=""
-    rm -f "${py}"
-    if [ -n "${cnt}" ]; then
-        log "  карта клиентов keycloak: сопоставлено ${cnt} из 4"
-        [ "${cnt}" = "4" ] || warn "не все секреты сопоставлены с клиентами Keycloak (см. ${KC_MAP_FILE})"
-    else
-        warn "не удалось построить keycloak-clients.map (realm-json не распарсился?)"
-    fi
 }
 
 _umount_lazy() {
@@ -1209,62 +1066,6 @@ cp -ra "${EXTENDED_SERVICES_PATH}" "${MAIN_BACKUP_DIR}/${EXTENDED_SERVICES_PATH}
 cp -ra "${ENV_FILES_PATH}"         "${MAIN_BACKUP_DIR}/${ENV_FILES_PATH}"
 cp -ra "${CUSTOM_CONFIGS_PATH}"    "${MAIN_BACKUP_DIR}/${CUSTOM_CONFIGS_PATH}"
 
-log "keycloak..."
-keycloak_container_id=$(require_container "${PROJECT}_keycloak" "keycloak")
-
-# Прошлый экспорт удаляется заранее: ошибка kc.sh export глушится, и без этого
-# в архив мог бы попасть realm от предыдущего прогона.
-docker exec -i "${keycloak_container_id}" rm -f /opt/keycloak/visiology-realm.json 2>/dev/null || true
-docker exec "${keycloak_container_id}" /opt/keycloak/bin/kc.sh export \
-    --file /opt/keycloak/visiology-realm.json --realm "${KEYCLOAK_REALM}" > "${error_output}" 2>&1 || true
-docker exec -i "${keycloak_container_id}" test -s /opt/keycloak/visiology-realm.json \
-    || die "kc.sh export не создал /opt/keycloak/visiology-realm.json (запустите с -d и посмотрите вывод)"
-docker cp "${keycloak_container_id}":/opt/keycloak/visiology-realm.json "${REALM_FILE}"
-grep -q '"realm"' "${REALM_FILE}" || die "visiology-realm.json не похож на экспорт realm"
-
-dump_keycloak_idp "${keycloak_container_id}"
-
-# Секреты читаются через docker exec -i, без -t.
-m2m_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_M2M_SECRET)
-grafana_client_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_GRAFANA_CLIENT_SECRET)
-public_dashboard_access_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_PUBLIC_DASHBOARD_ACCESS_SECRET)
-visiology_admin_realm_secret=$(read_secret_value "${keycloak_container_id}" KEYCLOAK_VISIOLOGY_ADMIN_REALM_SECRET)
-
-# Значения-заглушки. Должны совпадать байт в байт с константами *_old в штатном
-# restore.sh, который выполняет обратную подстановку при восстановлении.
-m2m_secret_new="68c96230-43e8-4308-b0ae-65835d8de35e"
-grafana_client_secret_new="749e9d46-1360-4c65-a0a0-82ba3e369b09"
-public_dashboard_access_secret_new="49d410ba-4e0d-4b1a-a064-834f41fb1cfd"
-visiology_admin_realm_secret_new="23e5da38-76e9-47d2-e12c-f0da9f039cc6"
-
-# Карта clientId строится ДО подмены - по реальным значениям секретов.
-write_keycloak_client_map
-
-if [ "${KC_KEEP_SECRETS}" = "1" ]; then
-    log "  подмена секретов пропущена (--keep-keycloak-secrets)"
-    echo "Секреты клиентов оставлены без изменений по ключу --keep-keycloak-secrets." >> "${KC_WARN_FILE}"
-else
-    replace_in_realm "${m2m_secret}"                     "${m2m_secret_new}"                     "KEYCLOAK_M2M_SECRET"
-    replace_in_realm "${grafana_client_secret}"          "${grafana_client_secret_new}"          "KEYCLOAK_GRAFANA_CLIENT_SECRET"
-    replace_in_realm "${public_dashboard_access_secret}" "${public_dashboard_access_secret_new}" "KEYCLOAK_PUBLIC_DASHBOARD_ACCESS_SECRET"
-    replace_in_realm "${visiology_admin_realm_secret}"   "${visiology_admin_realm_secret_new}"   "KEYCLOAK_VISIOLOGY_ADMIN_REALM_SECRET"
-
-    # В realm-json не должно остаться ни одного секрета исходного стенда:
-    # иначе архив непереносим на другую установку.
-    for _s in "${m2m_secret}" "${grafana_client_secret}" "${public_dashboard_access_secret}" "${visiology_admin_realm_secret}"; do
-        if grep -qF -- "${_s}" "${REALM_FILE}"; then
-            die "в visiology-realm.json остался секрет исходного стенда"
-        fi
-    done
-    unset _s
-fi
-# Символ \r внутри строки JSON недопустим: импорт realm его не примет, а
-# restore.sh глушит ошибку импорта уже после удаления realm.
-if LC_ALL=C grep -q $'\r' "${REALM_FILE}"; then
-    die "в visiology-realm.json есть символ \\r - kc.sh import такой файл не примет"
-fi
-log "  realm-json готов"
-
 log "minio..."
 mkdir -p "${MN_FILES_HOST_PATH}"
 minio_container_id=$(require_container "${PROJECT}_minio" "minio")
@@ -1329,11 +1130,6 @@ NOTIFY_ARCHIVE_SIZE=$(sudo du -h "${NOTIFY_ARCHIVE}" 2>/dev/null | cut -f1) || N
 freed=$(sudo du -sh "${MAIN_BACKUP_DIR}" 2>/dev/null | cut -f1) || freed=""
 sudo rm -rf "${MAIN_BACKUP_DIR:?}"/*
 log "каталог ${MAIN_BACKUP_DIR} очищен${freed:+, освобождено ${freed}}"
-
-if [ -f "${KC_WARN_FILE}" ]; then
-    warn "секреты Keycloak нормализованы не полностью, подробности в ${KC_WARN_FILE}"
-    warn "  после восстановления секреты клиентов нужно синхронизировать вручную"
-fi
 
 t_end=$(date +%s)
 elapsed=$(( (t_end - t_start) / 60 ))
