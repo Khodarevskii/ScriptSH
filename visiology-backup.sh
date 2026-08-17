@@ -452,6 +452,8 @@ VG_NAME="ubuntu-vg"
 LV_NAME="ubuntu-lv"
 SNAP_NAME="visiology_backup_snap"
 SNAP_PV="/dev/sdg"
+# Минимум свободного места на SNAP_PV под COW снапшота, МБ.
+SNAP_MIN_MB=1024
 
 CH_IMAGE="cr.yandex/crpe1mi33uplrq7coc9d/visiology/release/original/clickhouse-server:24.8.11.51285-alpine"
 CH_DB="visiology"
@@ -510,6 +512,7 @@ CH_STARTED=0
 SNAP_MOUNTED=0
 SNAP_CREATED=0
 CH_COPY_CREATED=0
+SNAP_FREE_MB=0
 
 ########################################
 # Общие помощники
@@ -656,6 +659,43 @@ _rm_temp_ch_containers() {
     for n in ${names}; do
         sudo docker rm -f "${n}" >/dev/null 2>&1 || true
     done
+}
+
+# Проверка условий для снапшота: том, диск под COW и место на нём.
+# Каждый отказ описывается отдельно - "нет места" и "диска нет" лечатся
+# по-разному. Вызывается в начале прогона, чтобы не выяснять это через час
+# работы, и повторно перед созданием снапшота, чтобы взять свежий объём.
+# Результат: SNAP_FREE_MB.
+check_snapshot_prereqs() {
+    local vg free_mb
+
+    sudo timeout 15 lvs "${VG_NAME}/${LV_NAME}" >/dev/null 2>&1 \
+        || die "нет логического тома ${VG_NAME}/${LV_NAME}, снимать снапшот не с чего.
+     Список томов: sudo lvs"
+
+    [ -b "${SNAP_PV}" ] \
+        || die "диск ${SNAP_PV} под снапшот не найден.
+     Список дисков: lsblk. Имя задаётся переменной SNAP_PV в начале скрипта."
+
+    vg=$(sudo timeout 15 pvs --noheadings -o vg_name "${SNAP_PV}" 2>/dev/null | tr -d ' ') || vg=""
+    [ -n "${vg}" ] \
+        || die "${SNAP_PV} не является физическим томом LVM.
+     Включить его в группу: sudo pvcreate ${SNAP_PV} && sudo vgextend ${VG_NAME} ${SNAP_PV}
+     ВНИМАНИЕ: pvcreate стирает начало диска, сначала проверьте, что он пуст: sudo blkid ${SNAP_PV}"
+
+    [ "${vg}" = "${VG_NAME}" ] \
+        || die "${SNAP_PV} входит в группу '${vg}', а снапшот снимается с '${VG_NAME}'.
+     Снапшот может занимать место только в своей группе."
+
+    free_mb=$(sudo timeout 15 pvs --noheadings -o pv_free --units m "${SNAP_PV}" 2>/dev/null | tr -d ' m<' | cut -d. -f1) || free_mb=""
+    case "${free_mb}" in
+        ''|*[!0-9]*) die "не удалось определить свободное место на ${SNAP_PV}. Проверьте: sudo pvs ${SNAP_PV}" ;;
+    esac
+    [ "${free_mb}" -gt "${SNAP_MIN_MB}" ] \
+        || die "на ${SNAP_PV} свободно ${free_mb}М, нужно больше ${SNAP_MIN_MB}М под COW снапшота.
+     Освободить место в группе или добавить диск: sudo vgextend ${VG_NAME} <диск>"
+
+    SNAP_FREE_MB="${free_mb}"
 }
 
 cleanup() {
@@ -964,11 +1004,11 @@ dump_clickhouse() {
         _umount_lazy "${SNAP_MNT}"; _remove_snapshot || true
     fi
 
-    local free_mb
-    free_mb=$(sudo pvs --noheadings -o pv_free --units m "${SNAP_PV}" 2>/dev/null | tr -d ' m<' | cut -d. -f1) || free_mb=""
-    [ -n "${free_mb}" ] && [ "${free_mb}" -gt 1024 ] || die "нет свободного места на ${SNAP_PV}"
-    log "  снапшот (COW ${free_mb}M)"
-    sudo lvcreate -s -n "${SNAP_NAME}" -L "${free_mb}M" "${VG_NAME}/${LV_NAME}" "${SNAP_PV}"
+    # Объём берётся заново: между стартом прогона и этим моментом место могло
+    # уйти, например под сборку самого бэкапа.
+    check_snapshot_prereqs
+    log "  снапшот (COW ${SNAP_FREE_MB}M)"
+    sudo lvcreate -s -n "${SNAP_NAME}" -L "${SNAP_FREE_MB}M" "${VG_NAME}/${LV_NAME}" "${SNAP_PV}"
     SNAP_CREATED=1
 
     sudo mkdir -p "${SNAP_MNT}"
@@ -1080,6 +1120,11 @@ XMLEOF
 # MAIN
 ########################################
 log "=== СТАРТ полного бэкапа Visiology ==="
+
+# Условия для снапшота проверяются до сбора данных: отказ на этом шаге
+# обесценивает весь прогон, а выясняется он иначе только через час работы.
+check_snapshot_prereqs
+log "снапшот: ${SNAP_PV} в группе ${VG_NAME}, свободно ${SNAP_FREE_MB}M"
 
 if [ "${CH_ONLY}" = "1" ]; then
     # Режим дополнительного хоста CH: каталог backup/ не очищается, собирается
