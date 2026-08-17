@@ -1207,7 +1207,7 @@ container_id=$(require_container "${PROJECT}_backup-service" "backup-service")
 # Код ответа проверяется явно. Без этого любая внутренняя ошибка сервиса, а он
 # отдаёт на них 500, прошла бы незамеченной: curl без -f считает такой ответ
 # успехом, и архив собрался бы без баз, отчитавшись успешным прогоном.
-bs_code=$(docker exec "${container_id}" curl -s -o /dev/null -w '%{http_code}' \
+bs_code=$(docker exec "${container_id}" curl -sL -o /dev/null -w '%{http_code}' \
     --request POST --url http://127.0.0.1:8000 \
     --header 'Content-Type: application/json' \
     --data '{"command":"backup","databases":["postgres", "smartforms"],"is_cleanup":true}') || bs_code=""
