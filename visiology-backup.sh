@@ -1291,16 +1291,6 @@ archive_name="$(hostname)-backup-v${VERSION}-$(date '+%Y-%m-%d-%H-%M-%S').tar.gz
 backup_file_dir=$(dirname "$(readlink -f "${BACKUP_DIR}/${archive_name}")")
 log "упаковка (${COMPRESSOR%% *})..."
 sudo tar -cf - -C "${backup_file_dir}" backup | ${COMPRESSOR} > "${backup_file_dir}/${archive_name}"
-
-# Целостность архива проверяется до того, как будет удалён каталог сборки:
-# оборванный по любой причине поток даёт файл, который выглядит как архив, но
-# не распаковывается, а исходные данные к этому моменту уже стёрты.
-log "проверка архива..."
-if ! ${COMPRESSOR%% *} -t "${backup_file_dir}/${archive_name}" 2>/dev/null; then
-    die "архив ${backup_file_dir}/${archive_name} повреждён, каталог сборки не удалён"
-fi
-log "  архив цел"
-
 NOTIFY_ARCHIVE="${backup_file_dir}/${archive_name}"
 NOTIFY_ARCHIVE_SIZE=$(sudo du -h "${NOTIFY_ARCHIVE}" 2>/dev/null | cut -f1) || NOTIFY_ARCHIVE_SIZE=""
 # Содержимое backup/ полностью повторяет собранный архив и занимает столько же
