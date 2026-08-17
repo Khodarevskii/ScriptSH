@@ -454,6 +454,10 @@ SNAP_NAME="visiology_backup_snap"
 SNAP_PV="/dev/sdg"
 # Минимум свободного места на SNAP_PV под COW снапшота, МБ.
 SNAP_MIN_MB=1024
+# Нижние пороги свободного места, ГБ. Это защита от полного диска, а не
+# расчёт под объём данных: реальная потребность зависит от размера базы.
+BACKUP_MIN_GB=20
+CH_COPY_MIN_GB=20
 
 CH_IMAGE="cr.yandex/crpe1mi33uplrq7coc9d/visiology/release/original/clickhouse-server:24.8.11.51285-alpine"
 CH_DB="visiology"
@@ -659,6 +663,56 @@ _rm_temp_ch_containers() {
     for n in ${names}; do
         sudo docker rm -f "${n}" >/dev/null 2>&1 || true
     done
+}
+
+# Свободное место в ГБ на файловой системе каталога. Если каталога ещё нет,
+# проверяется ближайший существующий родитель.
+_free_gb() {
+    local dir="$1"
+    while [ ! -d "${dir}" ] && [ "${dir}" != "/" ]; do dir=$(dirname "${dir}"); done
+    df -PBG "${dir}" 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print $4+0}'
+}
+
+# Условия, без которых прогон бессмысленен. Проверяются до сбора данных.
+# Под cron особенно важны первые две: без пароля sudo и без доступа к docker
+# прогон падал бы на первом же шаге с невнятной ошибкой.
+preflight_checks() {
+    sudo -n true 2>/dev/null \
+        || die "sudo требует пароль. Под cron это тупик: задание должно стоять в crontab пользователя root."
+
+    docker info >/dev/null 2>&1 \
+        || die "демон docker недоступен. Проверьте: sudo systemctl status docker"
+
+    local free
+    free=$(_free_gb "${BACKUP_DIR}")
+    [ -n "${free}" ] || die "не удалось определить свободное место в ${BACKUP_DIR}"
+    [ "${free}" -ge "${BACKUP_MIN_GB}" ] \
+        || die "в ${BACKUP_DIR} свободно ${free}G, порог ${BACKUP_MIN_GB}G. Здесь собирается backup/ и складывается архив."
+    log "место: ${BACKUP_DIR} - ${free}G"
+
+    free=$(_free_gb "${CH_COPY_DIR}")
+    [ -n "${free}" ] || die "не удалось определить свободное место для ${CH_COPY_DIR}"
+    [ "${free}" -ge "${CH_COPY_MIN_GB}" ] \
+        || die "для ${CH_COPY_DIR} свободно ${free}G, порог ${CH_COPY_MIN_GB}G. Сюда копируются данные ClickHouse со снапшота."
+    log "место: ${CH_COPY_DIR} - ${free}G"
+}
+
+# Состояние снапшота. COW ограничен, и при переполнении LVM помечает снапшот
+# недействительным: чтение с него даёт мусор или ошибки, а копия молча
+# получается неполной. Поэтому состояние проверяется после копирования.
+_snapshot_is_valid() {
+    local attr used
+    attr=$(sudo timeout 15 lvs --noheadings -o lv_attr "${VG_NAME}/${SNAP_NAME}" 2>/dev/null | tr -d ' ') || attr=""
+    [ -n "${attr}" ] || return 1
+    # Поля lv_attr: [0] тип тома, [4] состояние. 'S' в типе - недействительный
+    # снапшот, 'I' или 'S' в состоянии - то же самое.
+    case "${attr}" in S*) return 1 ;; esac
+    case "${attr:4:1}" in I|S) return 1 ;; esac
+
+    used=$(sudo timeout 15 lvs --noheadings -o data_percent "${VG_NAME}/${SNAP_NAME}" 2>/dev/null | tr -d ' ' | cut -d. -f1) || used=""
+    case "${used}" in ''|*[!0-9]*) return 0 ;; esac
+    [ "${used}" -lt 100 ] || return 1
+    return 0
 }
 
 # Проверка условий для снапшота: том, диск под COW и место на нём.
@@ -1049,6 +1103,15 @@ dump_clickhouse() {
         log "  ${chost}: копия готова, том целиком ($(sudo du -sh "${CH_COPY_DIR}/${chost}" 2>/dev/null | cut -f1))"
     done
 
+    # Снапшот проверяется до того, как копия пойдёт в дело: при переполнении COW
+    # LVM помечает его недействительным, и скопированные данные окажутся
+    # неполными без единой ошибки при копировании.
+    if ! _snapshot_is_valid; then
+        die "снапшот ${VG_NAME}/${SNAP_NAME} стал недействителен во время копирования (переполнен COW).
+     Копия данных ClickHouse неполна, архив собирать нельзя.
+     Увеличьте свободное место на ${SNAP_PV} или запускайте бэкап при меньшей нагрузке на запись."
+    fi
+
     # Точка монтирования больше не нужна и отцепляется сразу, но в фоне: umount
     # на снапшоте, удерживаемом антивирусом, может уйти в непрерываемый сон, где
     # ограничение по времени не работает. Обработчики внутри подшелла сброшены,
@@ -1123,6 +1186,7 @@ log "=== СТАРТ полного бэкапа Visiology ==="
 
 # Условия для снапшота проверяются до сбора данных: отказ на этом шаге
 # обесценивает весь прогон, а выясняется он иначе только через час работы.
+preflight_checks
 check_snapshot_prereqs
 log "снапшот: ${SNAP_PV} в группе ${VG_NAME}, свободно ${SNAP_FREE_MB}M"
 
@@ -1139,9 +1203,28 @@ echo "${COMMAND_LINE}" > "${MAIN_BACKUP_DIR}/${COMMAND_FILE}"
 
 log "backup-service: postgres, smartforms (без clickhouse)..."
 container_id=$(require_container "${PROJECT}_backup-service" "backup-service")
-docker exec "${container_id}" curl -sLv --request POST --url http://127.0.0.1:8000 \
+
+# Код ответа проверяется явно. Без этого любая внутренняя ошибка сервиса, а он
+# отдаёт на них 500, прошла бы незамеченной: curl без -f считает такой ответ
+# успехом, и архив собрался бы без баз, отчитавшись успешным прогоном.
+bs_code=$(docker exec "${container_id}" curl -s -o /dev/null -w '%{http_code}' \
+    --request POST --url http://127.0.0.1:8000 \
     --header 'Content-Type: application/json' \
-    --data '{"command":"backup","databases":["postgres", "smartforms"],"is_cleanup":true}'
+    --data '{"command":"backup","databases":["postgres", "smartforms"],"is_cleanup":true}') || bs_code=""
+case "${bs_code}" in
+    2??) ;;
+    "")  die "backup-service не ответил. Журнал: docker service logs --tail 50 ${PROJECT}_backup-service" ;;
+    *)   die "backup-service вернул код ${bs_code}, дамп баз не выполнен.
+     Журнал: docker service logs --tail 50 ${PROJECT}_backup-service" ;;
+esac
+
+# Ответ 200 сам по себе не доказывает, что файлы появились.
+for _d in postgres smartforms; do
+    [ -d "${MAIN_BACKUP_DIR}/${_d}" ] && [ -n "$(ls -A "${MAIN_BACKUP_DIR}/${_d}" 2>/dev/null)" ] \
+        || die "backup-service отчитался успехом, но ${MAIN_BACKUP_DIR}/${_d} пуст"
+done
+unset _d
+log "  postgres и smartforms выгружены"
 
 log "custom scripts..."
 mkdir -p "${DV_CUSTOM_SCRIPTS_HOST_PATH}"
@@ -1208,6 +1291,16 @@ archive_name="$(hostname)-backup-v${VERSION}-$(date '+%Y-%m-%d-%H-%M-%S').tar.gz
 backup_file_dir=$(dirname "$(readlink -f "${BACKUP_DIR}/${archive_name}")")
 log "упаковка (${COMPRESSOR%% *})..."
 sudo tar -cf - -C "${backup_file_dir}" backup | ${COMPRESSOR} > "${backup_file_dir}/${archive_name}"
+
+# Целостность архива проверяется до того, как будет удалён каталог сборки:
+# оборванный по любой причине поток даёт файл, который выглядит как архив, но
+# не распаковывается, а исходные данные к этому моменту уже стёрты.
+log "проверка архива..."
+if ! ${COMPRESSOR%% *} -t "${backup_file_dir}/${archive_name}" 2>/dev/null; then
+    die "архив ${backup_file_dir}/${archive_name} повреждён, каталог сборки не удалён"
+fi
+log "  архив цел"
+
 NOTIFY_ARCHIVE="${backup_file_dir}/${archive_name}"
 NOTIFY_ARCHIVE_SIZE=$(sudo du -h "${NOTIFY_ARCHIVE}" 2>/dev/null | cut -f1) || NOTIFY_ARCHIVE_SIZE=""
 # Содержимое backup/ полностью повторяет собранный архив и занимает столько же
