@@ -30,6 +30,8 @@ CH_ONLY=0
 FULL_CH_COPY=0
 # Отправить проверочное письмо и выйти, не запуская бэкап
 TEST_MAIL=0
+# Отправлять архив на удалённый HDD и чистить историю по сроку хранения
+REMOTE_STORE=0
 
 # Парсинг аргументов: -d/--debug (трассировка), -h/--help
 while [ "$1" != "" ]; do
@@ -53,6 +55,16 @@ while [ "$1" != "" ]; do
             echo "                хосту и пакуются вместе с ним."
             echo "  --test-mail   отправить проверочное письмо и выйти. Бэкап не"
             echo "                запускается, данные не трогаются."
+            echo "  --remote-store"
+            echo "                отправить собранный архив на удалённый HDD и"
+            echo "                удалить локальные копии, кроме самой свежей."
+            echo "                На HDD архивы раскладываются по папкам с"
+            echo "                именами серверов, история чистится по сроку"
+            echo "                хранения. Параметры - в блоке \"УДАЛЁННОЕ"
+            echo "                ХРАНИЛИЩЕ\" в начале скрипта."
+            echo "                Ключ и делает сервер боевым: файл скрипта на"
+            echo "                всех серверах одинаковый, различается строка"
+            echo "                запуска в cron."
             echo "  --full-ch-copy"
             echo "                копировать каталог данных ClickHouse целиком."
             echo "                По умолчанию копируются только каталоги базы,"
@@ -90,6 +102,9 @@ while [ "$1" != "" ]; do
             ;;
         "--test-mail")
             TEST_MAIL=1
+            ;;
+        "--remote-store")
+            REMOTE_STORE=1
             ;;
         "--ch-node")
             shift
@@ -135,6 +150,35 @@ SMTP_SKIP_VERIFY="true"   # не проверять сертификат рел�
 SMTP_USER="bi@example.ru"
 SMTP_PASSWORD=""
 
+########################################
+# УДАЛЁННОЕ ХРАНИЛИЩЕ АРХИВОВ (правится под контур)
+########################################
+# Работает только с ключом --remote-store. Блок стоит здесь, до разбора файла
+# настроек ниже, чтобы значения из файла перекрывали заданные тут - как у почты.
+#
+# Доступ по ключу, без пароля. Ключ хоста должен быть заранее в known_hosts:
+# соединение идёт в пакетном режиме и на запрос подтверждения не ответит, а
+# оборвётся. Разовая подготовка на боевом сервере:
+#   sudo ssh-keyscan -p 22 hdd.example.ru >> /root/.ssh/known_hosts
+REMOTE_HOST=""
+REMOTE_USER="backup"
+REMOTE_PORT="22"
+REMOTE_KEY="/root/.ssh/id_visiology_backup"
+# Корень на удалённом сервере. Архивы лягут в <корень>/<имя сервера>/
+REMOTE_ROOT="/srv/visiology-backups"
+# Срок хранения истории в папке этого сервера, дней.
+REMOTE_RETENTION_DAYS="30"
+# Сколько свежих архивов остаются независимо от возраста. Страховка на случай,
+# когда бэкапы не снимались дольше срока хранения: без неё ротация вычистила бы
+# всю историю подчистую.
+REMOTE_KEEP_MIN="2"
+# Ограничение по времени на передачу одного архива.
+REMOTE_XFER_TIMEOUT="4h"
+# Сверка контрольной суммы после передачи: auto | always | never.
+# При auto сумма считается только для scp - rsync проверяет целостность сам.
+# Чтение 13 ГБ с обеих сторон занимает минуты, поэтому always включают осознанно.
+REMOTE_VERIFY_CHECKSUM="auto"
+
 # Хранить пароль в скрипте не обязательно: если файл ниже существует, значения
 # из него перекрывают заданные выше. Формат KEY=VALUE, строки с # - комментарий.
 # Права - 600.
@@ -152,6 +196,8 @@ if [ -r "${NOTIFY_ENV}" ]; then
         _val="${_line#*=}"
         case "${_key}" in
             MAIL_TO|MAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_USE_SSL|SMTP_SKIP_VERIFY|SMTP_USER|SMTP_PASSWORD) ;;
+            REMOTE_HOST|REMOTE_USER|REMOTE_PORT|REMOTE_KEY|REMOTE_ROOT) ;;
+            REMOTE_RETENTION_DAYS|REMOTE_KEEP_MIN|REMOTE_XFER_TIMEOUT|REMOTE_VERIFY_CHECKSUM) ;;
             *) continue ;;
         esac
         # Кавычки вокруг значения снимаются, как это делал бы source.
@@ -175,6 +221,8 @@ exec 8>&-
 # Данные для письма, известные только к концу прогона.
 NOTIFY_ARCHIVE=""
 NOTIFY_ARCHIVE_SIZE=""
+# Итог доставки на HDD - отдельной строкой в письме.
+NOTIFY_REMOTE=""
 
 # Отправка отчёта. $1 - статус (ok|fail|running), далее - параметры прогона.
 #
@@ -362,6 +410,8 @@ def build_body(args, notes: list, log_tail: list) -> str:
         lines.append("Архив:         не собран")
     if args.log_file:
         lines.append(f"Журнал:        {args.log_file}")
+    if args.remote_status:
+        lines.append(f"Удалённый HDD: {args.remote_status}")
 
     if notes:
         lines += ["", f"Замечания ({len(notes)}):", ""]
@@ -383,6 +433,7 @@ def main() -> int:
     parser.add_argument("--archive", default="", help="путь к собранному архиву")
     parser.add_argument("--archive-size", default="", help="размер архива")
     parser.add_argument("--mode", default="", help="особый режим прогона")
+    parser.add_argument("--remote-status", default="", help="итог доставки на удалённый HDD")
     parser.add_argument("--notes-file", default="", help="файл с замечаниями, по строке")
     parser.add_argument("--log-file", default="", help="журнал прогона")
     args = parser.parse_args()
@@ -752,6 +803,229 @@ check_snapshot_prereqs() {
     SNAP_FREE_MB="${free_mb}"
 }
 
+########################################
+# Доставка архивов на удалённый HDD
+########################################
+# Включается ключом --remote-store. Провал доставки не отменяет бэкап: архив
+# собран локально, поэтому все отказы здесь - warn, а не die.
+
+# Параметры ssh, общие для всех вызовов.
+#   BatchMode=yes    - под cron ответить на запрос пароля некому, лучше отказ;
+#   ConnectTimeout   - недоступный сервер не должен подвешивать прогон;
+#   ServerAlive*     - обрыв на передаче многогигабайтного файла обнаруживается
+#                      за три минуты, а не висит до таймаута TCP.
+_remote_ssh_opts() {
+    printf '%s\n' -o BatchMode=yes -o ConnectTimeout=10 \
+                  -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+                  -p "${REMOTE_PORT}"
+    if [ -n "${REMOTE_KEY}" ]; then
+        printf '%s\n' -i "${REMOTE_KEY}"
+    fi
+}
+
+# Команда на удалённой стороне. Аргументы экранируются printf %q: имена файлов
+# проходят через ещё один разбор оболочкой на той стороне.
+#   $1 - предел по времени, далее - команда
+_remote_ssh() {
+    local tmo="$1"; shift
+    local opts=()
+    while IFS= read -r o; do opts+=("${o}"); done < <(_remote_ssh_opts)
+    timeout "${tmo}" ssh "${opts[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "$@"
+}
+
+# Размер файла на удалённой стороне; пусто, если файла нет.
+_remote_size() {
+    _remote_ssh 60 "$(printf 'stat -c %%s -- %q 2>/dev/null' "$1")" 2>/dev/null | tr -d ' \r' || true
+}
+
+# Передача одного файла. rsync предпочтительнее: докачивает прерванное и
+# проверяет переданное сам. Незавершённые куски он держит в отдельном каталоге,
+# поэтому оборванная передача не оставляет файл, похожий на готовый архив.
+_remote_put() {
+    local src="$1" dst_dir="$2"
+
+    if command -v rsync >/dev/null 2>&1; then
+        local rsh="ssh -o BatchMode=yes -o ConnectTimeout=10 -p ${REMOTE_PORT}"
+        [ -n "${REMOTE_KEY}" ] && rsh="${rsh} -i ${REMOTE_KEY}"
+        timeout "${REMOTE_XFER_TIMEOUT}" rsync -a --partial-dir=.rsync-partial \
+            -e "${rsh}" "${src}" "${REMOTE_USER}@${REMOTE_HOST}:${dst_dir}/"
+        return $?
+    fi
+
+    local opts=()
+    while IFS= read -r o; do opts+=("${o}"); done < <(_remote_ssh_opts)
+    # scp называет порт ключом -P, а не -p, поэтому список правится.
+    local i
+    for i in "${!opts[@]}"; do
+        [ "${opts[$i]}" = "-p" ] && opts[$i]="-P"
+    done
+    timeout "${REMOTE_XFER_TIMEOUT}" scp -p "${opts[@]}" \
+        "${src}" "${REMOTE_USER}@${REMOTE_HOST}:${dst_dir}/"
+}
+
+# Совпадает ли доставленный файл с исходным. Размер сверяется всегда, он ловит
+# обрыв передачи. Контрольная сумма - по настройке: rsync проверяет целостность
+# сам, а scp не проверяет ничего, поэтому при нём сумма считается по умолчанию.
+_remote_verify() {
+    local src="$1" dst="$2" want_sum="${3:-0}"
+    local lsize rsize lsum rsum
+
+    lsize=$(stat -c %s -- "${src}" 2>/dev/null) || lsize=""
+    rsize=$(_remote_size "${dst}")
+    if [ -z "${rsize}" ]; then
+        warn "HDD: файл не появился на удалённой стороне: ${dst}"
+        return 1
+    fi
+    if [ "${lsize}" != "${rsize}" ]; then
+        warn "HDD: размер не совпал (локально ${lsize}, на HDD ${rsize}): ${dst}"
+        return 1
+    fi
+    [ "${want_sum}" = "1" ] || return 0
+
+    log "  HDD: сверяю контрольную сумму (${lsize} байт с обеих сторон)"
+    lsum=$(sha256sum -- "${src}" 2>/dev/null | cut -d' ' -f1) || lsum=""
+    rsum=$(_remote_ssh 3600 "$(printf 'sha256sum -- %q 2>/dev/null' "${dst}")" 2>/dev/null | cut -d' ' -f1) || rsum=""
+    if [ -z "${lsum}" ] || [ -z "${rsum}" ]; then
+        warn "HDD: контрольную сумму получить не удалось, сверка по размеру пройдена"
+        return 0
+    fi
+    if [ "${lsum}" != "${rsum}" ]; then
+        warn "HDD: контрольные суммы разошлись: ${dst}"
+        return 1
+    fi
+    return 0
+}
+
+# Ротация в папке этого сервера. Удаляются архивы старше срока хранения, кроме
+# нескольких самых свежих: если бэкапы не снимались дольше срока, правило "всё
+# старше N дней" вычистило бы историю подчистую. Возвращает число удалённых.
+_remote_rotate() {
+    local rdir="$1" out
+    out=$(_remote_ssh 300 "bash -s -- $(printf '%q %q %q' "${rdir}" "${REMOTE_RETENTION_DAYS}" "${REMOTE_KEEP_MIN}")" <<'ROTATE'
+dir="$1"; days="$2"; keep="$3"
+cd -- "$dir" 2>/dev/null || { echo 0; exit 0; }
+# Список неприкосновенных: самые свежие по времени изменения.
+protected=$(ls -1t -- *.tar.gz 2>/dev/null | head -n "$keep")
+removed=0
+for f in $(find . -maxdepth 1 -type f -name '*.tar.gz' -mtime +"$days" -printf '%f\n' 2>/dev/null); do
+    if printf '%s\n' "$protected" | grep -qxF -- "$f"; then
+        continue
+    fi
+    rm -f -- "$f" && removed=$((removed + 1))
+done
+echo "$removed"
+ROTATE
+    ) || out=""
+    printf '%s' "${out}" | tr -cd '0-9'
+}
+
+# Доставка архивов на HDD и приведение локального каталога к одному архиву.
+#
+# Порядок безопасен по построению: локальные копии удаляются только после того,
+# как доставка подтверждена сверкой, а самый свежий архив остаётся локально в
+# любом случае. Состояния "на боевом нет ни одного архива" не возникает.
+#
+# Отправляется именно СВЕЖИЙ архив, а не предыдущий: иначе последняя копия
+# существовала бы в одном экземпляре, на самом боевом сервере.
+deliver_to_remote() {
+    local archive_dir="$1"
+    local rdir="${REMOTE_ROOT%/}/$(hostname)"
+
+    if [ -z "${REMOTE_HOST}" ]; then
+        warn "--remote-store задан, но REMOTE_HOST пуст - доставка пропущена"
+        NOTIFY_REMOTE="не настроено: REMOTE_HOST пуст"
+        return 0
+    fi
+
+    log "HDD: ${REMOTE_USER}@${REMOTE_HOST}:${rdir}"
+    if ! _remote_ssh 60 "$(printf 'mkdir -p -- %q' "${rdir}")"; then
+        warn "HDD: сервер недоступен или каталог ${rdir} не создан, архив остался только локально"
+        NOTIFY_REMOTE="ОШИБКА: ${REMOTE_HOST} недоступен, архив только локально"
+        return 0
+    fi
+
+    # Сверка суммы: при scp обязательна, при rsync - по настройке.
+    local want_sum=0
+    case "${REMOTE_VERIFY_CHECKSUM}" in
+        always) want_sum=1 ;;
+        never)  want_sum=0 ;;
+        *)      command -v rsync >/dev/null 2>&1 || want_sum=1 ;;
+    esac
+
+    # Обрабатываются только архивы этого сервера: в каталоге могут лежать чужие
+    # файлы, и трогать их права нет.
+    local pattern="$(hostname)-backup-v*.tar.gz"
+    local locals=()
+    local f
+    while IFS= read -r f; do
+        [ -n "${f}" ] && locals+=("${f}")
+    done < <(cd "${archive_dir}" 2>/dev/null && ls -1t -- ${pattern} 2>/dev/null || true)
+
+    if [ ${#locals[@]} -eq 0 ]; then
+        warn "HDD: локальных архивов не найдено в ${archive_dir}"
+        NOTIFY_REMOTE="локальных архивов не найдено"
+        return 0
+    fi
+
+    # Отправляется всё, чего на HDD ещё нет: если прошлый прогон не достучался
+    # до сервера, пропуск догружается сейчас.
+    local sent=0 failed=0 skipped=0 delivered=() lsize rsize
+    for f in "${locals[@]}"; do
+        lsize=$(stat -c %s -- "${archive_dir}/${f}" 2>/dev/null) || lsize=""
+        rsize=$(_remote_size "${rdir}/${f}")
+        if [ -n "${rsize}" ] && [ "${rsize}" = "${lsize}" ]; then
+            skipped=$((skipped + 1))
+            delivered+=("${f}")
+            continue
+        fi
+        log "  HDD: отправляю ${f}"
+        if ! _remote_put "${archive_dir}/${f}" "${rdir}"; then
+            warn "HDD: передача ${f} не завершилась"
+            failed=$((failed + 1))
+            continue
+        fi
+        if ! _remote_verify "${archive_dir}/${f}" "${rdir}/${f}" "${want_sum}"; then
+            # Недоставленный файл убирается с HDD. Он не архив, но называется как
+            # архив, и человек, разбирающий хранилище, примет его за годную
+            # копию. Исходник цел, следующий прогон отправит заново.
+            _remote_ssh 60 "$(printf 'rm -f -- %q' "${rdir}/${f}")" >/dev/null 2>&1 || true
+            warn "HDD: испорченный файл ${f} удалён с удалённой стороны"
+            failed=$((failed + 1))
+            continue
+        fi
+        log "  HDD: ${f} доставлен и сверен"
+        sent=$((sent + 1))
+        delivered+=("${f}")
+    done
+
+    # Локальные копии убираются только при полной доставке. Пока HDD недоступен,
+    # история копится локально - это лучше, чем остаться без неё вовсе.
+    local removed_local=0
+    if [ "${failed}" -eq 0 ]; then
+        local newest="${locals[0]}"
+        for f in "${delivered[@]}"; do
+            [ "${f}" = "${newest}" ] && continue
+            if sudo rm -f -- "${archive_dir}/${f}"; then
+                removed_local=$((removed_local + 1))
+            fi
+        done
+        [ "${removed_local}" -gt 0 ] && log "  локально удалено архивов: ${removed_local} (оставлен ${newest})"
+    else
+        warn "HDD: доставлено не всё (${failed} с ошибкой), локальные архивы сохранены: ${#locals[@]} шт."
+    fi
+
+    local rotated
+    rotated=$(_remote_rotate "${rdir}")
+    [ -n "${rotated}" ] || rotated="?"
+    log "  HDD: ротация старше ${REMOTE_RETENTION_DAYS} дн. - удалено ${rotated}"
+
+    if [ "${failed}" -eq 0 ]; then
+        NOTIFY_REMOTE="${rdir} - отправлено ${sent}, уже было ${skipped}, ротацией удалено ${rotated}, локально удалено ${removed_local}"
+    else
+        NOTIFY_REMOTE="ОШИБКА: не доставлено ${failed} из ${#locals[@]}, локальные архивы сохранены. Ротацией удалено ${rotated}"
+    fi
+}
+
 cleanup() {
     # Код возврата снимается первой же командой. Раньше сброс сигналов стоял в
     # самом обработчике EXIT, перед вызовом cleanup, и $? показывал результат
@@ -811,6 +1085,9 @@ cleanup() {
     fi
     if [ "${CH_ONLY}" = "1" ]; then
         nargs+=(--mode "только ClickHouse (--ch-only)")
+    fi
+    if [ -n "${NOTIFY_REMOTE}" ]; then
+        nargs+=(--remote-status "${NOTIFY_REMOTE}")
     fi
     # Успешным прогон считается только тогда, когда архив действительно собран.
     # Нулевой код сам по себе этого не доказывает: прогон могли прервать до
@@ -1306,6 +1583,12 @@ NOTIFY_ARCHIVE_SIZE=$(sudo du -h "${NOTIFY_ARCHIVE}" 2>/dev/null | cut -f1) || N
 freed=$(sudo du -sh "${MAIN_BACKUP_DIR}" 2>/dev/null | cut -f1) || freed=""
 sudo rm -rf "${MAIN_BACKUP_DIR:?}"/*
 log "каталог ${MAIN_BACKUP_DIR} очищен${freed:+, освобождено ${freed}}"
+
+# Доставка выполняется после очистки backup/: место уже освобождено, а архив
+# собран и проверен. Отказ доставки бэкап не отменяет.
+if [ "${REMOTE_STORE}" = "1" ]; then
+    deliver_to_remote "${backup_file_dir}"
+fi
 
 t_end=$(date +%s)
 elapsed=$(( (t_end - t_start) / 60 ))
