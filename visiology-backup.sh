@@ -1148,6 +1148,13 @@ dump_clickhouse() {
 </clickhouse>
 XMLEOF
 
+    # Права задаются явно, а не наследуются от umask: временный сервер работает
+    # под пользователем 101 и должен прочитать этот файл. На стенде со строгим
+    # umask (077) tee создаёт его с правами 600, и сервер падает при старте с
+    # "Failed to merge config ... Access to file denied".
+    sudo chmod 755 "${ch_conf_dir}"
+    sudo chmod 644 "${ch_conf_dir}/zz-backup-quiet.xml"
+
     for line in "${locals[@]}"; do
         IFS='|' read -r chost vol <<< "${line}"
         _dump_ch_node "${chost}" "${CH_COPY_DIR}/${chost}"
