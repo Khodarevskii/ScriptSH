@@ -160,10 +160,31 @@ SMTP_PASSWORD=""
 # соединение идёт в пакетном режиме и на запрос подтверждения не ответит, а
 # оборвётся. Разовая подготовка на боевом сервере:
 #   sudo ssh-keyscan -p 22 hdd.example.ru >> /root/.ssh/known_hosts
+# Адрес хранилища: имя или IP-адрес, равнозначно.
 REMOTE_HOST=""
 REMOTE_USER="backup"
 REMOTE_PORT="22"
+
+# Способ передачи: scp | rsync | auto.
+# scp есть везде; rsync докачивает прерванное и проверяет переданное сам, но
+# должен быть установлен с обеих сторон. auto выбирает rsync при наличии.
+REMOTE_METHOD="scp"
+
+# Аутентификация. Предпочтителен ключ: его можно ограничить на стороне
+# хранилища так, чтобы он умел только принимать файлы, и отозвать отдельно для
+# каждого сервера. Пароль такой возможности не даёт - это полный доступ к
+# серверу для всякого, кто его прочитал.
 REMOTE_KEY="/root/.ssh/id_visiology_backup"
+
+# Пароль вместо ключа. В самом скрипте оставлять пустым: скрипт лежит в
+# репозитории и читается всеми, кому доступен каталог платформы. Значение
+# задаётся в /etc/visiology-backup.env с правами 600, права проверяются перед
+# использованием. Пароль передаётся через переменную окружения (sshpass -e),
+# а не аргументом командной строки: аргументы видны в выводе ps любому
+# пользователю сервера, окружение процесса - только root.
+REMOTE_PASSWORD=""
+# Либо путь к файлу, где лежит только пароль, первой строкой.
+REMOTE_PASSWORD_FILE=""
 # Корень на удалённом сервере. Архивы лягут в <корень>/<имя сервера>/
 REMOTE_ROOT="/srv/visiology-backups"
 # Срок хранения истории в папке этого сервера, дней.
@@ -197,6 +218,7 @@ if [ -r "${NOTIFY_ENV}" ]; then
         case "${_key}" in
             MAIL_TO|MAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_USE_SSL|SMTP_SKIP_VERIFY|SMTP_USER|SMTP_PASSWORD) ;;
             REMOTE_HOST|REMOTE_USER|REMOTE_PORT|REMOTE_KEY|REMOTE_ROOT) ;;
+            REMOTE_METHOD|REMOTE_PASSWORD|REMOTE_PASSWORD_FILE) ;;
             REMOTE_RETENTION_DAYS|REMOTE_KEEP_MIN|REMOTE_XFER_TIMEOUT|REMOTE_VERIFY_CHECKSUM) ;;
             *) continue ;;
         esac
@@ -809,17 +831,70 @@ check_snapshot_prereqs() {
 # Включается ключом --remote-store. Провал доставки не отменяет бэкап: архив
 # собран локально, поэтому все отказы здесь - warn, а не die.
 
+# Способ входа выбирается один раз за прогон: REMOTE_AUTH = key | password.
+# Пароль берётся из настроек или из файла; в обоих случаях проверяются права:
+# доступный для чтения посторонним файл с паролем - это тот же пароль в открытом
+# виде, только с ложным ощущением защищённости.
+REMOTE_AUTH="key"
+_remote_auth_setup() {
+    REMOTE_AUTH="key"
+
+    if [ -n "${REMOTE_PASSWORD_FILE}" ]; then
+        if [ ! -r "${REMOTE_PASSWORD_FILE}" ]; then
+            warn "HDD: файл с паролем ${REMOTE_PASSWORD_FILE} недоступен для чтения"
+            return 1
+        fi
+        _remote_check_perms "${REMOTE_PASSWORD_FILE}"
+        REMOTE_PASSWORD=$(head -n1 -- "${REMOTE_PASSWORD_FILE}" | tr -d '\r\n')
+    elif [ -n "${REMOTE_PASSWORD}" ] && [ -f "${NOTIFY_ENV}" ]; then
+        # Пароль пришёл из файла настроек - проверяем права у него.
+        _remote_check_perms "${NOTIFY_ENV}"
+    fi
+
+    [ -n "${REMOTE_PASSWORD}" ] || return 0
+
+    if ! command -v sshpass >/dev/null 2>&1; then
+        warn "HDD: задан пароль, но sshpass не установлен. Поставьте его (apt install sshpass) либо перейдите на вход по ключу"
+        return 1
+    fi
+    REMOTE_AUTH="password"
+    log "  HDD: вход по паролю. Надёжнее ключ: его можно ограничить на стороне хранилища и отозвать отдельно для каждого сервера"
+    return 0
+}
+
+# Права файла с секретом. Читаемый группой или остальными - повод для замечания
+# в отчёте, но не для отказа: решение остаётся за администратором.
+_remote_check_perms() {
+    local f="$1" mode
+    mode=$(stat -c %a -- "${f}" 2>/dev/null) || return 0
+    case "${mode}" in
+        *[1-7][0-7]|*[0-7][1-7])
+            warn "HDD: ${f} доступен не только владельцу (права ${mode}). Закройте: sudo chmod 600 ${f}"
+            ;;
+    esac
+}
+
 # Параметры ssh, общие для всех вызовов.
 #   BatchMode=yes    - под cron ответить на запрос пароля некому, лучше отказ;
 #   ConnectTimeout   - недоступный сервер не должен подвешивать прогон;
 #   ServerAlive*     - обрыв на передаче многогигабайтного файла обнаруживается
 #                      за три минуты, а не висит до таймаута TCP.
 _remote_ssh_opts() {
-    printf '%s\n' -o BatchMode=yes -o ConnectTimeout=10 \
+    printf '%s\n' -o ConnectTimeout=10 \
                   -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
                   -p "${REMOTE_PORT}"
-    if [ -n "${REMOTE_KEY}" ]; then
-        printf '%s\n' -i "${REMOTE_KEY}"
+    if [ "${REMOTE_AUTH}" = "password" ]; then
+        # BatchMode запрещает ввод пароля, поэтому при входе по паролю его
+        # включать нельзя. Ключи отключаются явно, иначе ssh сначала переберёт
+        # их и может упереться в лимит попыток, так и не дойдя до пароля.
+        # Одна попытка вместо трёх: под cron повторять всё равно некому.
+        printf '%s\n' -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1
+    else
+        # Под cron ответить на запрос пароля некому: лучше отказ, чем зависание.
+        printf '%s\n' -o BatchMode=yes
+        if [ -n "${REMOTE_KEY}" ]; then
+            printf '%s\n' -i "${REMOTE_KEY}"
+        fi
     fi
 }
 
@@ -828,9 +903,11 @@ _remote_ssh_opts() {
 #   $1 - предел по времени, далее - команда
 _remote_ssh() {
     local tmo="$1"; shift
-    local opts=()
+    local opts=() o pre=()
     while IFS= read -r o; do opts+=("${o}"); done < <(_remote_ssh_opts)
-    timeout "${tmo}" ssh "${opts[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "$@"
+    [ "${REMOTE_AUTH}" = "password" ] && pre=(sshpass -e)
+    SSHPASS="${REMOTE_PASSWORD}" timeout "${tmo}" "${pre[@]}" ssh "${opts[@]}" \
+        "${REMOTE_USER}@${REMOTE_HOST}" "$@"
 }
 
 # Размер файла на удалённой стороне; пусто, если файла нет.
@@ -842,25 +919,45 @@ _remote_size() {
 # проверяет переданное сам. Незавершённые куски он держит в отдельном каталоге,
 # поэтому оборванная передача не оставляет файл, похожий на готовый архив.
 _remote_put() {
-    local src="$1" dst_dir="$2"
+    local src="$1" dst_dir="$2" o
+    local use_rsync=0
+    case "${REMOTE_METHOD}" in
+        rsync) use_rsync=1 ;;
+        auto)  command -v rsync >/dev/null 2>&1 && use_rsync=1 ;;
+        *)     use_rsync=0 ;;
+    esac
+    if [ "${use_rsync}" = "1" ] && ! command -v rsync >/dev/null 2>&1; then
+        warn "HDD: REMOTE_METHOD=${REMOTE_METHOD}, но rsync не установлен - передаю через scp"
+        use_rsync=0
+    fi
 
-    if command -v rsync >/dev/null 2>&1; then
-        local rsh="ssh -o BatchMode=yes -o ConnectTimeout=10 -p ${REMOTE_PORT}"
-        [ -n "${REMOTE_KEY}" ] && rsh="${rsh} -i ${REMOTE_KEY}"
-        timeout "${REMOTE_XFER_TIMEOUT}" rsync -a --partial-dir=.rsync-partial \
-            -e "${rsh}" "${src}" "${REMOTE_USER}@${REMOTE_HOST}:${dst_dir}/"
+    local pre=()
+    [ "${REMOTE_AUTH}" = "password" ] && pre=(sshpass -e)
+
+    if [ "${use_rsync}" = "1" ]; then
+        # Транспорт для rsync собирается строкой: он сам вызывает ssh.
+        local rsh="ssh -o ConnectTimeout=10 -p ${REMOTE_PORT}"
+        if [ "${REMOTE_AUTH}" = "password" ]; then
+            rsh="${rsh} -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1"
+        else
+            rsh="${rsh} -o BatchMode=yes"
+            [ -n "${REMOTE_KEY}" ] && rsh="${rsh} -i ${REMOTE_KEY}"
+        fi
+        SSHPASS="${REMOTE_PASSWORD}" timeout "${REMOTE_XFER_TIMEOUT}" "${pre[@]}" \
+            rsync -a --partial-dir=.rsync-partial -e "${rsh}" \
+            "${src}" "${REMOTE_USER}@${REMOTE_HOST}:${dst_dir}/"
         return $?
     fi
 
     local opts=()
     while IFS= read -r o; do opts+=("${o}"); done < <(_remote_ssh_opts)
-    # scp называет порт ключом -P, а не -p, поэтому список правится.
+    # Порт у scp задаётся заглавной -P, у ssh строчной -p.
     local i
     for i in "${!opts[@]}"; do
         [ "${opts[$i]}" = "-p" ] && opts[$i]="-P"
     done
-    timeout "${REMOTE_XFER_TIMEOUT}" scp -p "${opts[@]}" \
-        "${src}" "${REMOTE_USER}@${REMOTE_HOST}:${dst_dir}/"
+    SSHPASS="${REMOTE_PASSWORD}" timeout "${REMOTE_XFER_TIMEOUT}" "${pre[@]}" \
+        scp -p "${opts[@]}" "${src}" "${REMOTE_USER}@${REMOTE_HOST}:${dst_dir}/"
 }
 
 # Совпадает ли доставленный файл с исходным. Размер сверяется всегда, он ловит
@@ -937,6 +1034,11 @@ deliver_to_remote() {
         return 0
     fi
 
+    if ! _remote_auth_setup; then
+        NOTIFY_REMOTE="ОШИБКА: не настроен доступ к ${REMOTE_HOST}, архив только локально"
+        return 0
+    fi
+
     log "HDD: ${REMOTE_USER}@${REMOTE_HOST}:${rdir}"
     if ! _remote_ssh 60 "$(printf 'mkdir -p -- %q' "${rdir}")"; then
         warn "HDD: сервер недоступен или каталог ${rdir} не создан, архив остался только локально"
@@ -945,11 +1047,18 @@ deliver_to_remote() {
     fi
 
     # Сверка суммы: при scp обязательна, при rsync - по настройке.
+    # scp не проверяет переданное вовсе, поэтому при нём сумма считается всегда.
+    # rsync проверяет целостность сам, и повторное чтение обеих копий - это
+    # лишние минуты на каждом гигабайте.
     local want_sum=0
     case "${REMOTE_VERIFY_CHECKSUM}" in
         always) want_sum=1 ;;
         never)  want_sum=0 ;;
-        *)      command -v rsync >/dev/null 2>&1 || want_sum=1 ;;
+        *)      case "${REMOTE_METHOD}" in
+                    rsync) want_sum=0 ;;
+                    auto)  command -v rsync >/dev/null 2>&1 || want_sum=1 ;;
+                    *)     want_sum=1 ;;
+                esac ;;
     esac
 
     # Обрабатываются только архивы этого сервера: в каталоге могут лежать чужие
