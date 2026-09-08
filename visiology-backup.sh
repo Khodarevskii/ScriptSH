@@ -32,6 +32,8 @@ FULL_CH_COPY=0
 TEST_MAIL=0
 # Отправлять архив на удалённый HDD и чистить историю по сроку хранения
 REMOTE_STORE=0
+# Дополнительно класть копию архива на тестовый стенд
+TEST_STORE=0
 
 # Парсинг аргументов: -d/--debug (трассировка), -h/--help
 while [ "$1" != "" ]; do
@@ -65,6 +67,12 @@ while [ "$1" != "" ]; do
             echo "                Ключ и делает сервер боевым: файл скрипта на"
             echo "                всех серверах одинаковый, различается строка"
             echo "                запуска в cron."
+            echo "  --test-store  дополнительно положить копию архива на тестовый"
+            echo "                стенд. Локальные архивы от этого не зависят: не"
+            echo "                доехало - замечание в письме, и только."
+            echo "                Ставится на одном сервере, чьими данными"
+            echo "                наполняется тест. Настройки - ключи TEST_* в"
+            echo "                файле настроек."
             echo "  --full-ch-copy"
             echo "                копировать каталог данных ClickHouse целиком."
             echo "                По умолчанию копируются только каталоги базы,"
@@ -105,6 +113,9 @@ while [ "$1" != "" ]; do
             ;;
         "--remote-store")
             REMOTE_STORE=1
+            ;;
+        "--test-store")
+            TEST_STORE=1
             ;;
         "--ch-node")
             shift
@@ -178,6 +189,10 @@ if [ -r "${NOTIFY_ENV}" ]; then
             REMOTE_HOST|REMOTE_USER|REMOTE_PORT|REMOTE_KEY|REMOTE_ROOT|REMOTE_METHOD) ;;
             REMOTE_PASSWORD|REMOTE_PASSWORD_FILE|REMOTE_RETENTION_DAYS|REMOTE_KEEP_MIN) ;;
             REMOTE_XFER_TIMEOUT|REMOTE_VERIFY_CHECKSUM) ;;
+            # Тестовый стенд как второе назначение
+            TEST_HOST|TEST_USER|TEST_PORT|TEST_KEY|TEST_ROOT|TEST_METHOD) ;;
+            TEST_PASSWORD|TEST_PASSWORD_FILE|TEST_RETENTION_DAYS|TEST_KEEP_MIN) ;;
+            TEST_XFER_TIMEOUT|TEST_VERIFY_CHECKSUM) ;;
             # LVM-снапшот и место
             VG_NAME|LV_NAME|SNAP_NAME|SNAP_PV|SNAP_MNT|SNAP_MIN_MB|BACKUP_MIN_GB|CH_COPY_MIN_GB) ;;
             # ClickHouse
@@ -220,6 +235,22 @@ fi
 : "${REMOTE_XFER_TIMEOUT:=4h}"
 : "${REMOTE_VERIFY_CHECKSUM:=auto}"  # auto | always | never
 
+# Тестовый стенд. Всё, кроме адреса и каталога, по умолчанию наследуется от
+# основного хранилища: обычно отличаются только они.
+: "${TEST_HOST:=}"                   # пусто - копия на тест не отправляется
+: "${TEST_USER:=${REMOTE_USER}}"
+: "${TEST_PORT:=${REMOTE_PORT}}"
+: "${TEST_KEY:=${REMOTE_KEY}}"
+: "${TEST_ROOT:=}"
+: "${TEST_METHOD:=${REMOTE_METHOD}}"
+: "${TEST_PASSWORD:=}"
+: "${TEST_PASSWORD_FILE:=}"
+# На тесте история не нужна: там держится последняя копия, место дороже.
+: "${TEST_RETENTION_DAYS:=7}"
+: "${TEST_KEEP_MIN:=1}"
+: "${TEST_XFER_TIMEOUT:=${REMOTE_XFER_TIMEOUT}}"
+: "${TEST_VERIFY_CHECKSUM:=${REMOTE_VERIFY_CHECKSUM}}"
+
 : "${SNAP_NAME:=visiology_backup_snap}"
 : "${SNAP_MNT:=/mnt/vis_snap}"
 : "${SNAP_MIN_MB:=1024}"             # минимум свободного места под COW, МБ
@@ -251,8 +282,12 @@ exec 8>&-
 # Данные для письма, известные только к концу прогона.
 NOTIFY_ARCHIVE=""
 NOTIFY_ARCHIVE_SIZE=""
-# Итог доставки на HDD - отдельной строкой в письме.
+# Итоги доставки - отдельными строками в письме.
 NOTIFY_REMOTE=""
+NOTIFY_TEST=""
+# Как называть назначение в журнале и в письме. Меняется на время доставки
+# на тестовый стенд.
+REMOTE_LABEL="HDD"
 
 # Отправка отчёта. $1 - статус (ok|fail|running), далее - параметры прогона.
 #
@@ -442,6 +477,9 @@ def build_body(args, notes: list, log_tail: list) -> str:
         lines.append(f"Журнал:        {args.log_file}")
     if args.remote_status:
         lines.append(f"Удалённый HDD: {args.remote_status}")
+    if args.test_status:
+        lines.append(f"Тестовый стенд:{args.test_status}" if args.test_status.startswith(" ")
+                     else f"Тестовый стенд: {args.test_status}")
 
     if notes:
         lines += ["", f"Замечания ({len(notes)}):", ""]
@@ -464,6 +502,7 @@ def main() -> int:
     parser.add_argument("--archive-size", default="", help="размер архива")
     parser.add_argument("--mode", default="", help="особый режим прогона")
     parser.add_argument("--remote-status", default="", help="итог доставки на удалённый HDD")
+    parser.add_argument("--test-status", default="", help="итог копии на тестовый стенд")
     parser.add_argument("--notes-file", default="", help="файл с замечаниями, по строке")
     parser.add_argument("--log-file", default="", help="журнал прогона")
     args = parser.parse_args()
@@ -816,7 +855,7 @@ _remote_auth_setup() {
 
     if [ -n "${REMOTE_PASSWORD_FILE}" ]; then
         if [ ! -r "${REMOTE_PASSWORD_FILE}" ]; then
-            warn "HDD: файл с паролем ${REMOTE_PASSWORD_FILE} недоступен для чтения"
+            warn "${REMOTE_LABEL}: файл с паролем ${REMOTE_PASSWORD_FILE} недоступен для чтения"
             return 1
         fi
         _remote_check_perms "${REMOTE_PASSWORD_FILE}"
@@ -829,11 +868,11 @@ _remote_auth_setup() {
     [ -n "${REMOTE_PASSWORD}" ] || return 0
 
     if ! command -v sshpass >/dev/null 2>&1; then
-        warn "HDD: задан пароль, но sshpass не установлен. Поставьте его (apt install sshpass) либо перейдите на вход по ключу"
+        warn "${REMOTE_LABEL}: задан пароль, но sshpass не установлен. Поставьте его (apt install sshpass) либо перейдите на вход по ключу"
         return 1
     fi
     REMOTE_AUTH="password"
-    log "  HDD: вход по паролю. Надёжнее ключ: его можно ограничить на стороне хранилища и отозвать отдельно для каждого сервера"
+    log "  ${REMOTE_LABEL}: вход по паролю. Надёжнее ключ: его можно ограничить на стороне хранилища и отозвать отдельно для каждого сервера"
     return 0
 }
 
@@ -844,7 +883,7 @@ _remote_check_perms() {
     mode=$(stat -c %a -- "${f}" 2>/dev/null) || return 0
     case "${mode}" in
         *[1-7][0-7]|*[0-7][1-7])
-            warn "HDD: ${f} доступен не только владельцу (права ${mode}). Закройте: sudo chmod 600 ${f}"
+            warn "${REMOTE_LABEL}: ${f} доступен не только владельцу (права ${mode}). Закройте: sudo chmod 600 ${f}"
             ;;
     esac
 }
@@ -902,7 +941,7 @@ _remote_put() {
         *)     use_rsync=0 ;;
     esac
     if [ "${use_rsync}" = "1" ] && ! command -v rsync >/dev/null 2>&1; then
-        warn "HDD: REMOTE_METHOD=${REMOTE_METHOD}, но rsync не установлен - передаю через scp"
+        warn "${REMOTE_LABEL}: REMOTE_METHOD=${REMOTE_METHOD}, но rsync не установлен - передаю через scp"
         use_rsync=0
     fi
 
@@ -945,24 +984,24 @@ _remote_verify() {
     lsize=$(stat -c %s -- "${src}" 2>/dev/null) || lsize=""
     rsize=$(_remote_size "${dst}")
     if [ -z "${rsize}" ]; then
-        warn "HDD: файл не появился на удалённой стороне: ${dst}"
+        warn "${REMOTE_LABEL}: файл не появился на удалённой стороне: ${dst}"
         return 1
     fi
     if [ "${lsize}" != "${rsize}" ]; then
-        warn "HDD: размер не совпал (локально ${lsize}, на HDD ${rsize}): ${dst}"
+        warn "${REMOTE_LABEL}: размер не совпал (локально ${lsize}, на HDD ${rsize}): ${dst}"
         return 1
     fi
     [ "${want_sum}" = "1" ] || return 0
 
-    log "  HDD: сверяю контрольную сумму (${lsize} байт с обеих сторон)"
+    log "  ${REMOTE_LABEL}: сверяю контрольную сумму (${lsize} байт с обеих сторон)"
     lsum=$(sha256sum -- "${src}" 2>/dev/null | cut -d' ' -f1) || lsum=""
     rsum=$(_remote_ssh 3600 "$(printf 'sha256sum -- %q 2>/dev/null' "${dst}")" 2>/dev/null | cut -d' ' -f1) || rsum=""
     if [ -z "${lsum}" ] || [ -z "${rsum}" ]; then
-        warn "HDD: контрольную сумму получить не удалось, сверка по размеру пройдена"
+        warn "${REMOTE_LABEL}: контрольную сумму получить не удалось, сверка по размеру пройдена"
         return 0
     fi
     if [ "${lsum}" != "${rsum}" ]; then
-        warn "HDD: контрольные суммы разошлись: ${dst}"
+        warn "${REMOTE_LABEL}: контрольные суммы разошлись: ${dst}"
         return 1
     fi
     return 0
@@ -999,8 +1038,15 @@ ROTATE
 #
 # Отправляется именно СВЕЖИЙ архив, а не предыдущий: иначе последняя копия
 # существовала бы в одном экземпляре, на самом боевом сервере.
+#   $1 - каталог с архивами, $2 - режим:
+#        store - основное хранилище: после подтверждённой доставки локальные
+#                копии, кроме самой свежей, удаляются;
+#        copy  - дополнительное назначение (тестовый стенд): локальные архивы
+#                не трогаются вовсе. Судьба локальных копий должна зависеть
+#                только от основного хранилища, иначе недоступность теста
+#                начала бы копить архивы на боевом сервере.
 deliver_to_remote() {
-    local archive_dir="$1"
+    local archive_dir="$1" mode="${2:-store}"
     local rdir="${REMOTE_ROOT%/}/$(hostname)"
 
     if [ -z "${REMOTE_HOST}" ]; then
@@ -1014,9 +1060,9 @@ deliver_to_remote() {
         return 0
     fi
 
-    log "HDD: ${REMOTE_USER}@${REMOTE_HOST}:${rdir}"
+    log "${REMOTE_LABEL}: ${REMOTE_USER}@${REMOTE_HOST}:${rdir}"
     if ! _remote_ssh 60 "$(printf 'mkdir -p -- %q' "${rdir}")"; then
-        warn "HDD: сервер недоступен или каталог ${rdir} не создан, архив остался только локально"
+        warn "${REMOTE_LABEL}: сервер недоступен или каталог ${rdir} не создан, архив остался только локально"
         NOTIFY_REMOTE="ОШИБКА: ${REMOTE_HOST} недоступен, архив только локально"
         return 0
     fi
@@ -1046,7 +1092,7 @@ deliver_to_remote() {
     done < <(cd "${archive_dir}" 2>/dev/null && ls -1t -- ${pattern} 2>/dev/null || true)
 
     if [ ${#locals[@]} -eq 0 ]; then
-        warn "HDD: локальных архивов не найдено в ${archive_dir}"
+        warn "${REMOTE_LABEL}: локальных архивов не найдено в ${archive_dir}"
         NOTIFY_REMOTE="локальных архивов не найдено"
         return 0
     fi
@@ -1062,9 +1108,9 @@ deliver_to_remote() {
             delivered+=("${f}")
             continue
         fi
-        log "  HDD: отправляю ${f}"
+        log "  ${REMOTE_LABEL}: отправляю ${f}"
         if ! _remote_put "${archive_dir}/${f}" "${rdir}"; then
-            warn "HDD: передача ${f} не завершилась"
+            warn "${REMOTE_LABEL}: передача ${f} не завершилась"
             failed=$((failed + 1))
             continue
         fi
@@ -1073,11 +1119,11 @@ deliver_to_remote() {
             # архив, и человек, разбирающий хранилище, примет его за годную
             # копию. Исходник цел, следующий прогон отправит заново.
             _remote_ssh 60 "$(printf 'rm -f -- %q' "${rdir}/${f}")" >/dev/null 2>&1 || true
-            warn "HDD: испорченный файл ${f} удалён с удалённой стороны"
+            warn "${REMOTE_LABEL}: испорченный файл ${f} удалён с удалённой стороны"
             failed=$((failed + 1))
             continue
         fi
-        log "  HDD: ${f} доставлен и сверен"
+        log "  ${REMOTE_LABEL}: ${f} доставлен и сверен"
         sent=$((sent + 1))
         delivered+=("${f}")
     done
@@ -1085,7 +1131,9 @@ deliver_to_remote() {
     # Локальные копии убираются только при полной доставке. Пока HDD недоступен,
     # история копится локально - это лучше, чем остаться без неё вовсе.
     local removed_local=0
-    if [ "${failed}" -eq 0 ]; then
+    if [ "${failed}" -eq 0 ] && [ "${mode}" = "copy" ]; then
+        : # копия на тестовый стенд локальные архивы не трогает
+    elif [ "${failed}" -eq 0 ]; then
         local newest="${locals[0]}"
         for f in "${delivered[@]}"; do
             [ "${f}" = "${newest}" ] && continue
@@ -1095,19 +1143,57 @@ deliver_to_remote() {
         done
         [ "${removed_local}" -gt 0 ] && log "  локально удалено архивов: ${removed_local} (оставлен ${newest})"
     else
-        warn "HDD: доставлено не всё (${failed} с ошибкой), локальные архивы сохранены: ${#locals[@]} шт."
+        warn "${REMOTE_LABEL}: доставлено не всё (${failed} с ошибкой), локальные архивы сохранены: ${#locals[@]} шт."
     fi
 
     local rotated
     rotated=$(_remote_rotate "${rdir}")
     [ -n "${rotated}" ] || rotated="?"
-    log "  HDD: ротация старше ${REMOTE_RETENTION_DAYS} дн. - удалено ${rotated}"
+    log "  ${REMOTE_LABEL}: ротация старше ${REMOTE_RETENTION_DAYS} дн. - удалено ${rotated}"
 
     if [ "${failed}" -eq 0 ]; then
         NOTIFY_REMOTE="${rdir} - отправлено ${sent}, уже было ${skipped}, ротацией удалено ${rotated}, локально удалено ${removed_local}"
     else
         NOTIFY_REMOTE="ОШИБКА: не доставлено ${failed} из ${#locals[@]}, локальные архивы сохранены. Ротацией удалено ${rotated}"
     fi
+}
+
+# Копия архива на тестовый стенд. Функции доставки написаны под один набор
+# переменных, а назначений у нас два, поэтому профиль подменяется на время
+# вызова и возвращается обратно: отчёт и всё, что идёт следом, должны видеть
+# исходные значения основного хранилища.
+deliver_to_test() {
+    local archive_dir="$1"
+
+    if [ -z "${TEST_HOST}" ] || [ -z "${TEST_ROOT}" ]; then
+        warn "--test-store задан, но TEST_HOST или TEST_ROOT пусты - копия на тест пропущена"
+        NOTIFY_TEST="не настроено: TEST_HOST или TEST_ROOT пусты"
+        return 0
+    fi
+
+    local s_host="${REMOTE_HOST}" s_user="${REMOTE_USER}" s_port="${REMOTE_PORT}"
+    local s_key="${REMOTE_KEY}" s_root="${REMOTE_ROOT}" s_method="${REMOTE_METHOD}"
+    local s_pass="${REMOTE_PASSWORD}" s_passfile="${REMOTE_PASSWORD_FILE}"
+    local s_days="${REMOTE_RETENTION_DAYS}" s_keep="${REMOTE_KEEP_MIN}"
+    local s_tmo="${REMOTE_XFER_TIMEOUT}" s_sum="${REMOTE_VERIFY_CHECKSUM}"
+    local s_label="${REMOTE_LABEL}" s_notify="${NOTIFY_REMOTE}" s_auth="${REMOTE_AUTH}"
+
+    REMOTE_HOST="${TEST_HOST}"; REMOTE_USER="${TEST_USER}"; REMOTE_PORT="${TEST_PORT}"
+    REMOTE_KEY="${TEST_KEY}"; REMOTE_ROOT="${TEST_ROOT}"; REMOTE_METHOD="${TEST_METHOD}"
+    REMOTE_PASSWORD="${TEST_PASSWORD}"; REMOTE_PASSWORD_FILE="${TEST_PASSWORD_FILE}"
+    REMOTE_RETENTION_DAYS="${TEST_RETENTION_DAYS}"; REMOTE_KEEP_MIN="${TEST_KEEP_MIN}"
+    REMOTE_XFER_TIMEOUT="${TEST_XFER_TIMEOUT}"; REMOTE_VERIFY_CHECKSUM="${TEST_VERIFY_CHECKSUM}"
+    REMOTE_LABEL="тест"; NOTIFY_REMOTE=""
+
+    deliver_to_remote "${archive_dir}" copy
+    NOTIFY_TEST="${NOTIFY_REMOTE}"
+
+    REMOTE_HOST="${s_host}"; REMOTE_USER="${s_user}"; REMOTE_PORT="${s_port}"
+    REMOTE_KEY="${s_key}"; REMOTE_ROOT="${s_root}"; REMOTE_METHOD="${s_method}"
+    REMOTE_PASSWORD="${s_pass}"; REMOTE_PASSWORD_FILE="${s_passfile}"
+    REMOTE_RETENTION_DAYS="${s_days}"; REMOTE_KEEP_MIN="${s_keep}"
+    REMOTE_XFER_TIMEOUT="${s_tmo}"; REMOTE_VERIFY_CHECKSUM="${s_sum}"
+    REMOTE_LABEL="${s_label}"; NOTIFY_REMOTE="${s_notify}"; REMOTE_AUTH="${s_auth}"
 }
 
 cleanup() {
@@ -1172,6 +1258,9 @@ cleanup() {
     fi
     if [ -n "${NOTIFY_REMOTE}" ]; then
         nargs+=(--remote-status "${NOTIFY_REMOTE}")
+    fi
+    if [ -n "${NOTIFY_TEST}" ]; then
+        nargs+=(--test-status "${NOTIFY_TEST}")
     fi
     # Успешным прогон считается только тогда, когда архив действительно собран.
     # Нулевой код сам по себе этого не доказывает: прогон могли прервать до
@@ -1671,7 +1760,13 @@ log "каталог ${MAIN_BACKUP_DIR} очищен${freed:+, освобожде
 # Доставка выполняется после очистки backup/: место уже освобождено, а архив
 # собран и проверен. Отказ доставки бэкап не отменяет.
 if [ "${REMOTE_STORE}" = "1" ]; then
-    deliver_to_remote "${backup_file_dir}"
+    deliver_to_remote "${backup_file_dir}" store
+fi
+
+# Копия на тестовый стенд идёт после основного хранилища: сохранность архива
+# важнее, чем наполнение теста.
+if [ "${TEST_STORE}" = "1" ]; then
+    deliver_to_test "${backup_file_dir}"
 fi
 
 t_end=$(date +%s)
