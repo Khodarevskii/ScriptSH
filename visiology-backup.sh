@@ -131,83 +131,39 @@ SCRIPT_DIR=$( dirname -- "$( readlink -f -- "$0")")
 t_start=$(date +%s)
 T_START_HUMAN=$(date '+%F %T')
 
-########################################
-# ОТЧЁТ ПО ПОЧТЕ (правится под контур)
-########################################
-# Пустой MAIL_TO отключает отправку. Получатели перечисляются через запятую.
-MAIL_TO="user1@example.ru,user2@example.ru"
-MAIL_FROM="bi@example.ru"
-SMTP_HOST="mail.example.ru"
-SMTP_PORT="25"
-# Шифрование. Порт 25 и 587 - обычно STARTTLS, порт 465 - SSL с первого байта.
-# Режим должен соответствовать порту: на 465 без SMTP_USE_SSL соединение просто
-# висит до таймаута, потому что релей ждёт TLS, а клиент - текстовое приветствие.
-SMTP_USE_TLS="false"      # STARTTLS после подключения (порт 25/587)
-SMTP_USE_SSL="false"      # TLS сразу при подключении (порт 465)
-SMTP_SKIP_VERIFY="true"   # не проверять сертификат релея (самоподписанный)
-# Пароль пуст: релей контура принимает почту без авторизации. Вход выполняется,
-# только если заданы и имя, и пароль.
-SMTP_USER="bi@example.ru"
-SMTP_PASSWORD=""
+LOG_TAG="[visiology-backup]"
+
+# Замечания и причина аварии дублируются в файл: из него итоговое письмо
+# собирает раздел "Замечания". Через файл, а не переменную, потому что die
+# вызывается в том числе внутри подстановок команд, где присваивание пропадёт.
+NOTIFY_NOTES=$(mktemp /tmp/visiology-backup-notes.XXXXXX) || NOTIFY_NOTES=/dev/null
+
+log() { echo "$(date '+%F %T') ${LOG_TAG} $*"; }
+warn() {
+    echo "$(date '+%F %T') ${LOG_TAG} ВНИМАНИЕ: $*" >&2
+    printf 'ВНИМАНИЕ: %s\n' "$*" >> "${NOTIFY_NOTES}" 2>/dev/null || true
+}
+die() {
+    echo "$(date '+%F %T') ${LOG_TAG} ОШИБКА: $*" >&2
+    printf 'ОШИБКА: %s\n' "$*" >> "${NOTIFY_NOTES}" 2>/dev/null || true
+    exit 1
+}
 
 ########################################
-# УДАЛЁННОЕ ХРАНИЛИЩЕ АРХИВОВ (правится под контур)
+# НАСТРОЙКИ
 ########################################
-# Работает только с ключом --remote-store. Блок стоит здесь, до разбора файла
-# настроек ниже, чтобы значения из файла перекрывали заданные тут - как у почты.
+# Значений контура в самом скрипте нет: все они живут в файле ниже. Благодаря
+# этому файл скрипта побайтно одинаков на всех серверах и обновляется простым
+# копированием, ничего не затирая, а различия между серверами собраны в одном
+# месте.
 #
-# Доступ по ключу, без пароля. Ключ хоста должен быть заранее в known_hosts:
-# соединение идёт в пакетном режиме и на запрос подтверждения не ответит, а
-# оборвётся. Разовая подготовка на боевом сервере:
-#   sudo ssh-keyscan -p 22 hdd.example.ru >> /root/.ssh/known_hosts
-# Адрес хранилища: имя или IP-адрес, равнозначно.
-REMOTE_HOST=""
-REMOTE_USER="backup"
-REMOTE_PORT="22"
-
-# Способ передачи: scp | rsync | auto.
-# scp есть везде; rsync докачивает прерванное и проверяет переданное сам, но
-# должен быть установлен с обеих сторон. auto выбирает rsync при наличии.
-REMOTE_METHOD="scp"
-
-# Аутентификация. Предпочтителен ключ: его можно ограничить на стороне
-# хранилища так, чтобы он умел только принимать файлы, и отозвать отдельно для
-# каждого сервера. Пароль такой возможности не даёт - это полный доступ к
-# серверу для всякого, кто его прочитал.
-REMOTE_KEY="/root/.ssh/id_visiology_backup"
-
-# Пароль вместо ключа. В самом скрипте оставлять пустым: скрипт лежит в
-# репозитории и читается всеми, кому доступен каталог платформы. Значение
-# задаётся в /etc/visiology-backup.env с правами 600, права проверяются перед
-# использованием. Пароль передаётся через переменную окружения (sshpass -e),
-# а не аргументом командной строки: аргументы видны в выводе ps любому
-# пользователю сервера, окружение процесса - только root.
-REMOTE_PASSWORD=""
-# Либо путь к файлу, где лежит только пароль, первой строкой.
-REMOTE_PASSWORD_FILE=""
-# Корень на удалённом сервере. Архивы лягут в <корень>/<имя сервера>/
-REMOTE_ROOT="/srv/visiology-backups"
-# Срок хранения истории в папке этого сервера, дней.
-REMOTE_RETENTION_DAYS="30"
-# Сколько свежих архивов остаются независимо от возраста. Страховка на случай,
-# когда бэкапы не снимались дольше срока хранения: без неё ротация вычистила бы
-# всю историю подчистую.
-REMOTE_KEEP_MIN="2"
-# Ограничение по времени на передачу одного архива.
-REMOTE_XFER_TIMEOUT="4h"
-# Сверка контрольной суммы после передачи: auto | always | never.
-# При auto сумма считается только для scp - rsync проверяет целостность сам.
-# Чтение 13 ГБ с обеих сторон занимает минуты, поэтому always включают осознанно.
-REMOTE_VERIFY_CHECKSUM="auto"
-
-# Хранить пароль в скрипте не обязательно: если файл ниже существует, значения
-# из него перекрывают заданные выше. Формат KEY=VALUE, строки с # - комментарий.
-# Права - 600.
+# Формат KEY=VALUE, строки с # - комментарий, права 600 (там пароли).
+# Образец со всеми ключами и пояснениями - visiology-backup.env.example.
 #
 # Файл разбирается построчно, а не через source: значение с пробелом (например
 # список получателей через ", ") bash попытался бы выполнить как команду, а сам
 # файл настроек получил бы право запускать что угодно. Ключи вне списка ниже
-# игнорируются, чтобы файл не переопределял настройки самого бэкапа.
+# игнорируются.
 NOTIFY_ENV="${NOTIFY_ENV:-/etc/visiology-backup.env}"
 if [ -r "${NOTIFY_ENV}" ]; then
     while IFS= read -r _line || [ -n "${_line}" ]; do
@@ -216,10 +172,17 @@ if [ -r "${NOTIFY_ENV}" ]; then
         _key="${_line%%=*}"
         _val="${_line#*=}"
         case "${_key}" in
+            # Почта
             MAIL_TO|MAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_USE_SSL|SMTP_SKIP_VERIFY|SMTP_USER|SMTP_PASSWORD) ;;
-            REMOTE_HOST|REMOTE_USER|REMOTE_PORT|REMOTE_KEY|REMOTE_ROOT) ;;
-            REMOTE_METHOD|REMOTE_PASSWORD|REMOTE_PASSWORD_FILE) ;;
-            REMOTE_RETENTION_DAYS|REMOTE_KEEP_MIN|REMOTE_XFER_TIMEOUT|REMOTE_VERIFY_CHECKSUM) ;;
+            # Удалённое хранилище
+            REMOTE_HOST|REMOTE_USER|REMOTE_PORT|REMOTE_KEY|REMOTE_ROOT|REMOTE_METHOD) ;;
+            REMOTE_PASSWORD|REMOTE_PASSWORD_FILE|REMOTE_RETENTION_DAYS|REMOTE_KEEP_MIN) ;;
+            REMOTE_XFER_TIMEOUT|REMOTE_VERIFY_CHECKSUM) ;;
+            # LVM-снапшот и место
+            VG_NAME|LV_NAME|SNAP_NAME|SNAP_PV|SNAP_MNT|SNAP_MIN_MB|BACKUP_MIN_GB|CH_COPY_MIN_GB) ;;
+            # ClickHouse
+            CH_IMAGE|CH_DB|CH_TEMP_NAME|CH_HOST_LABEL|CH_VOLUME|CH_COPY_DIR) ;;
+            CH_CPUS|CH_MEMORY|CH_CPU_SHARES|DUMP_PARALLEL) ;;
             *) continue ;;
         esac
         # Кавычки вокруг значения снимаются, как это делал бы source.
@@ -231,6 +194,51 @@ if [ -r "${NOTIFY_ENV}" ]; then
     done < "${NOTIFY_ENV}"
     unset _line _key _val
 fi
+
+# Значения по умолчанию для того, что одинаково на всех контурах. Подстановка
+# ":=" срабатывает, только если ключа в файле настроек не было.
+: "${MAIL_TO:=}"                     # пусто - отчёты по почте не отправляются
+: "${MAIL_FROM:=visiology-backup@$(hostname)}"
+: "${SMTP_HOST:=localhost}"
+: "${SMTP_PORT:=25}"
+: "${SMTP_USE_TLS:=false}"           # STARTTLS после подключения (порт 25/587)
+: "${SMTP_USE_SSL:=false}"           # TLS сразу при подключении (порт 465)
+: "${SMTP_SKIP_VERIFY:=false}"
+: "${SMTP_USER:=}"
+: "${SMTP_PASSWORD:=}"
+
+: "${REMOTE_HOST:=}"                 # пусто - доставка на HDD не настроена
+: "${REMOTE_USER:=visiology-backup}"
+: "${REMOTE_PORT:=22}"
+: "${REMOTE_KEY:=/root/.ssh/id_visiology_backup}"
+: "${REMOTE_ROOT:=}"
+: "${REMOTE_METHOD:=scp}"            # scp | rsync | auto
+: "${REMOTE_PASSWORD:=}"             # предпочтителен вход по ключу
+: "${REMOTE_PASSWORD_FILE:=}"
+: "${REMOTE_RETENTION_DAYS:=30}"
+: "${REMOTE_KEEP_MIN:=2}"            # свежие архивы, которые ротация не трогает
+: "${REMOTE_XFER_TIMEOUT:=4h}"
+: "${REMOTE_VERIFY_CHECKSUM:=auto}"  # auto | always | never
+
+: "${SNAP_NAME:=visiology_backup_snap}"
+: "${SNAP_MNT:=/mnt/vis_snap}"
+: "${SNAP_MIN_MB:=1024}"             # минимум свободного места под COW, МБ
+# Нижние пороги свободного места, ГБ. Это защита от полного диска, а не расчёт
+# под объём данных: реальная потребность зависит от размера базы.
+: "${BACKUP_MIN_GB:=20}"
+: "${CH_COPY_MIN_GB:=20}"
+
+: "${CH_IMAGE:=cr.yandex/crpe1mi33uplrq7coc9d/visiology/release/original/clickhouse-server:24.8.11.51285-alpine}"
+: "${CH_DB:=visiology}"
+: "${CH_TEMP_NAME:=ch_temp_backup}"  # префикс имени временных контейнеров
+# Резервные значения на случай, если ни backup-service, ни Swarm опросить не
+# удалось. В норме имя каталога и имя тома определяются автоматически.
+: "${CH_HOST_LABEL:=clickhouse-1}"
+: "${CH_VOLUME:=visiology3_clickhouse_data}"
+: "${CH_CPUS:=4}"
+: "${CH_MEMORY:=16g}"
+: "${CH_CPU_SHARES:=512}"
+: "${DUMP_PARALLEL:=4}"
 
 # Путь к журналу нужен письму, чтобы приложить последние строки при аварии. Под
 # cron поток вывода перенаправлен в файл, и его имя видно через /proc. Дескриптор
@@ -509,6 +517,21 @@ fi
 # письмом, иначе под cron он останется незамеченным.
 trap 'rc=$?; [ "${rc}" -eq 0 ] || notify fail --rc "${rc}" --started "${T_START_HUMAN}"; exit "${rc}"' EXIT
 
+# Значения, которые различаются от сервера к серверу и у которых не может быть
+# разумного значения по умолчанию: ошибиться в них - значит снять снапшот не с
+# того тома или сложить копию данных не на тот диск. Отсутствие любого из них
+# прерывает прогон до единого обращения к платформе.
+_missing=""
+for _v in VG_NAME LV_NAME SNAP_PV CH_COPY_DIR; do
+    [ -n "${!_v}" ] || _missing="${_missing} ${_v}"
+done
+if [ -n "${_missing}" ]; then
+    die "в ${NOTIFY_ENV} не заданы обязательные настройки:${_missing}
+     Образец со всеми ключами: visiology-backup.env.example рядом со скриптом."
+fi
+unset _missing _v
+
+
 pushd "${SCRIPT_DIR}" >/dev/null
 
 source config.env
@@ -517,36 +540,6 @@ source defaults.env
 # Версия: из конфигов (если там задана VI_VERSION), иначе значение по умолчанию.
 # Правится под контур, т.к. версии на контурах разные.
 VERSION="${VI_VERSION:-3.16.1}"
-
-########################################
-# КОНФИГУРАЦИЯ CH-БЛОКА (правится под контур)
-########################################
-VG_NAME="ubuntu-vg"
-LV_NAME="ubuntu-lv"
-SNAP_NAME="visiology_backup_snap"
-SNAP_PV="/dev/sdg"
-# Минимум свободного места на SNAP_PV под COW снапшота, МБ.
-SNAP_MIN_MB=1024
-# Нижние пороги свободного места, ГБ. Это защита от полного диска, а не
-# расчёт под объём данных: реальная потребность зависит от размера базы.
-BACKUP_MIN_GB=20
-CH_COPY_MIN_GB=20
-
-CH_IMAGE="cr.yandex/crpe1mi33uplrq7coc9d/visiology/release/original/clickhouse-server:24.8.11.51285-alpine"
-CH_DB="visiology"
-CH_TEMP_NAME="ch_temp_backup"     # префикс имени временных контейнеров
-
-# Резервные значения на случай, если ни backup-service, ни Swarm опросить не
-# удалось. В норме имя каталога и имя тома определяются автоматически.
-CH_HOST_LABEL="clickhouse-1"
-CH_VOLUME="visiology3_clickhouse_data"
-CH_CPUS="4"
-CH_MEMORY="16g"
-CH_CPU_SHARES="512"
-DUMP_PARALLEL="4"
-
-SNAP_MNT="/mnt/vis_snap"
-CH_COPY_DIR="/mnt/disk2/vis_ch_copy"   # копии данных CH: <CH_COPY_DIR>/<хост CH>
 
 if command -v pigz >/dev/null 2>&1; then
     COMPRESSOR="pigz -p ${CH_CPUS}"
@@ -567,24 +560,6 @@ EXTENDED_SERVICES_PATH="extended-services"
 ENV_FILES_PATH="env-files"
 CUSTOM_CONFIGS_PATH="custom-configs"
 COMMAND_FILE="command.txt"
-LOG_TAG="[visiology-backup]"
-
-# Замечания и причина аварии дублируются в файл: из него итоговое письмо
-# собирает раздел "Замечания". Через файл, а не переменную, потому что die
-# вызывается в том числе внутри подстановок команд, где присваивание пропадёт.
-NOTIFY_NOTES=$(mktemp /tmp/visiology-backup-notes.XXXXXX) || NOTIFY_NOTES=/dev/null
-
-log() { echo "$(date '+%F %T') ${LOG_TAG} $*"; }
-warn() {
-    echo "$(date '+%F %T') ${LOG_TAG} ВНИМАНИЕ: $*" >&2
-    printf 'ВНИМАНИЕ: %s\n' "$*" >> "${NOTIFY_NOTES}" 2>/dev/null || true
-}
-die() {
-    echo "$(date '+%F %T') ${LOG_TAG} ОШИБКА: $*" >&2
-    printf 'ОШИБКА: %s\n' "$*" >> "${NOTIFY_NOTES}" 2>/dev/null || true
-    exit 1
-}
-
 CH_STARTED=0
 SNAP_MOUNTED=0
 SNAP_CREATED=0
