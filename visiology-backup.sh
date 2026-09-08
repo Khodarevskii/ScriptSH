@@ -186,13 +186,13 @@ if [ -r "${NOTIFY_ENV}" ]; then
             # Почта
             MAIL_TO|MAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_USE_SSL|SMTP_SKIP_VERIFY|SMTP_USER|SMTP_PASSWORD) ;;
             # Удалённое хранилище
-            REMOTE_HOST|REMOTE_USER|REMOTE_PORT|REMOTE_KEY|REMOTE_ROOT|REMOTE_METHOD) ;;
+            REMOTE_HOST|REMOTE_USER|REMOTE_PORT|REMOTE_KEY|REMOTE_ROOT|REMOTE_METHOD|REMOTE_DIR_NAME) ;;
             REMOTE_PASSWORD|REMOTE_PASSWORD_FILE|REMOTE_RETENTION_DAYS|REMOTE_KEEP_MIN) ;;
             REMOTE_XFER_TIMEOUT|REMOTE_VERIFY_CHECKSUM) ;;
             # Тестовый стенд как второе назначение
             TEST_HOST|TEST_USER|TEST_PORT|TEST_KEY|TEST_ROOT|TEST_METHOD) ;;
             TEST_PASSWORD|TEST_PASSWORD_FILE|TEST_RETENTION_DAYS|TEST_KEEP_MIN) ;;
-            TEST_XFER_TIMEOUT|TEST_VERIFY_CHECKSUM) ;;
+            TEST_XFER_TIMEOUT|TEST_VERIFY_CHECKSUM|TEST_DIR_NAME) ;;
             # LVM-снапшот и место
             VG_NAME|LV_NAME|SNAP_NAME|SNAP_PV|SNAP_MNT|SNAP_MIN_MB|BACKUP_MIN_GB|CH_COPY_MIN_GB) ;;
             # ClickHouse
@@ -227,6 +227,8 @@ fi
 : "${REMOTE_PORT:=22}"
 : "${REMOTE_KEY:=/root/.ssh/id_visiology_backup}"
 : "${REMOTE_ROOT:=}"
+# Имя папки этого сервера внутри REMOTE_ROOT. Пусто - берётся имя хоста.
+: "${REMOTE_DIR_NAME:=}"
 : "${REMOTE_METHOD:=scp}"            # scp | rsync | auto
 : "${REMOTE_PASSWORD:=}"             # предпочтителен вход по ключу
 : "${REMOTE_PASSWORD_FILE:=}"
@@ -242,6 +244,7 @@ fi
 : "${TEST_PORT:=${REMOTE_PORT}}"
 : "${TEST_KEY:=${REMOTE_KEY}}"
 : "${TEST_ROOT:=}"
+: "${TEST_DIR_NAME:=${REMOTE_DIR_NAME}}"
 : "${TEST_METHOD:=${REMOTE_METHOD}}"
 : "${TEST_PASSWORD:=}"
 : "${TEST_PASSWORD_FILE:=}"
@@ -1047,7 +1050,16 @@ ROTATE
 #                начала бы копить архивы на боевом сервере.
 deliver_to_remote() {
     local archive_dir="$1" mode="${2:-store}"
-    local rdir="${REMOTE_ROOT%/}/$(hostname)"
+    # Имя папки внутри хранилища: заданное в настройках или имя хоста. Косая
+    # черта в имени запрещена - иначе значение из файла настроек могло бы
+    # увести запись за пределы REMOTE_ROOT.
+    local dir_name="${REMOTE_DIR_NAME}"
+    case "${dir_name}" in
+        */*) warn "${REMOTE_LABEL}: в имени папки '${dir_name}' есть '/', беру имя хоста"
+             dir_name="" ;;
+    esac
+    [ -n "${dir_name}" ] || dir_name="$(hostname)"
+    local rdir="${REMOTE_ROOT%/}/${dir_name}"
 
     if [ -z "${REMOTE_HOST}" ]; then
         warn "--remote-store задан, но REMOTE_HOST пуст - доставка пропущена"
@@ -1177,12 +1189,14 @@ deliver_to_test() {
     local s_days="${REMOTE_RETENTION_DAYS}" s_keep="${REMOTE_KEEP_MIN}"
     local s_tmo="${REMOTE_XFER_TIMEOUT}" s_sum="${REMOTE_VERIFY_CHECKSUM}"
     local s_label="${REMOTE_LABEL}" s_notify="${NOTIFY_REMOTE}" s_auth="${REMOTE_AUTH}"
+    local s_dirname="${REMOTE_DIR_NAME}"
 
     REMOTE_HOST="${TEST_HOST}"; REMOTE_USER="${TEST_USER}"; REMOTE_PORT="${TEST_PORT}"
     REMOTE_KEY="${TEST_KEY}"; REMOTE_ROOT="${TEST_ROOT}"; REMOTE_METHOD="${TEST_METHOD}"
     REMOTE_PASSWORD="${TEST_PASSWORD}"; REMOTE_PASSWORD_FILE="${TEST_PASSWORD_FILE}"
     REMOTE_RETENTION_DAYS="${TEST_RETENTION_DAYS}"; REMOTE_KEEP_MIN="${TEST_KEEP_MIN}"
     REMOTE_XFER_TIMEOUT="${TEST_XFER_TIMEOUT}"; REMOTE_VERIFY_CHECKSUM="${TEST_VERIFY_CHECKSUM}"
+    REMOTE_DIR_NAME="${TEST_DIR_NAME}"
     REMOTE_LABEL="тест"; NOTIFY_REMOTE=""
 
     deliver_to_remote "${archive_dir}" copy
@@ -1194,6 +1208,7 @@ deliver_to_test() {
     REMOTE_RETENTION_DAYS="${s_days}"; REMOTE_KEEP_MIN="${s_keep}"
     REMOTE_XFER_TIMEOUT="${s_tmo}"; REMOTE_VERIFY_CHECKSUM="${s_sum}"
     REMOTE_LABEL="${s_label}"; NOTIFY_REMOTE="${s_notify}"; REMOTE_AUTH="${s_auth}"
+    REMOTE_DIR_NAME="${s_dirname}"
 }
 
 cleanup() {
