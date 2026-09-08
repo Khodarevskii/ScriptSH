@@ -187,7 +187,7 @@ if [ -r "${NOTIFY_ENV}" ]; then
             MAIL_TO|MAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_USE_SSL|SMTP_SKIP_VERIFY|SMTP_USER|SMTP_PASSWORD) ;;
             # Удалённое хранилище
             REMOTE_HOST|REMOTE_USER|REMOTE_PORT|REMOTE_KEY|REMOTE_ROOT|REMOTE_METHOD|REMOTE_DIR_NAME) ;;
-            REMOTE_FILE_MODE|TEST_FILE_MODE) ;;
+            REMOTE_FILE_MODE|TEST_FILE_MODE|REMOTE_DIR_MODE|TEST_DIR_MODE) ;;
             REMOTE_PASSWORD|REMOTE_PASSWORD_FILE|REMOTE_RETENTION_DAYS|REMOTE_KEEP_MIN) ;;
             REMOTE_XFER_TIMEOUT|REMOTE_VERIFY_CHECKSUM) ;;
             # Тестовый стенд как второе назначение
@@ -235,6 +235,11 @@ fi
 # бы с правами 600, и группа сопровождения не смогла бы его прочитать.
 # Пусто - права не трогать.
 : "${REMOTE_FILE_MODE:=640}"
+# Права на папку сервера в хранилище. Тоже выставляются явно: каталог создаётся
+# удалённым mkdir, и без этого его режим зависел бы от umask хранилища. 755
+# позволяет любому сотруднику зайти и посмотреть список архивов, а прочитать их
+# по-прежнему может только владелец - для этого нужен sudo.
+: "${REMOTE_DIR_MODE:=755}"
 : "${REMOTE_METHOD:=scp}"            # scp | rsync | auto
 : "${REMOTE_PASSWORD:=}"             # предпочтителен вход по ключу
 : "${REMOTE_PASSWORD_FILE:=}"
@@ -252,6 +257,7 @@ fi
 : "${TEST_ROOT:=}"
 : "${TEST_DIR_NAME:=${REMOTE_DIR_NAME}}"
 : "${TEST_FILE_MODE:=${REMOTE_FILE_MODE}}"
+: "${TEST_DIR_MODE:=${REMOTE_DIR_MODE}}"
 : "${TEST_METHOD:=${REMOTE_METHOD}}"
 : "${TEST_PASSWORD:=}"
 : "${TEST_PASSWORD_FILE:=}"
@@ -1086,6 +1092,11 @@ deliver_to_remote() {
         return 0
     fi
 
+    if [ -n "${REMOTE_DIR_MODE}" ]; then
+        _remote_ssh 60 "$(printf 'chmod %s -- %q' "${REMOTE_DIR_MODE}" "${rdir}")" >/dev/null 2>&1 \
+            || warn "${REMOTE_LABEL}: права ${REMOTE_DIR_MODE} на каталог выставить не удалось"
+    fi
+
     # Сверка суммы: при scp обязательна, при rsync - по настройке.
     # scp не проверяет переданное вовсе, поэтому при нём сумма считается всегда.
     # rsync проверяет целостность сам, и повторное чтение обеих копий - это
@@ -1200,7 +1211,7 @@ deliver_to_test() {
     local s_days="${REMOTE_RETENTION_DAYS}" s_keep="${REMOTE_KEEP_MIN}"
     local s_tmo="${REMOTE_XFER_TIMEOUT}" s_sum="${REMOTE_VERIFY_CHECKSUM}"
     local s_label="${REMOTE_LABEL}" s_notify="${NOTIFY_REMOTE}" s_auth="${REMOTE_AUTH}"
-    local s_dirname="${REMOTE_DIR_NAME}" s_mode="${REMOTE_FILE_MODE}"
+    local s_dirname="${REMOTE_DIR_NAME}" s_mode="${REMOTE_FILE_MODE}" s_dmode="${REMOTE_DIR_MODE}"
 
     REMOTE_HOST="${TEST_HOST}"; REMOTE_USER="${TEST_USER}"; REMOTE_PORT="${TEST_PORT}"
     REMOTE_KEY="${TEST_KEY}"; REMOTE_ROOT="${TEST_ROOT}"; REMOTE_METHOD="${TEST_METHOD}"
@@ -1208,6 +1219,7 @@ deliver_to_test() {
     REMOTE_RETENTION_DAYS="${TEST_RETENTION_DAYS}"; REMOTE_KEEP_MIN="${TEST_KEEP_MIN}"
     REMOTE_XFER_TIMEOUT="${TEST_XFER_TIMEOUT}"; REMOTE_VERIFY_CHECKSUM="${TEST_VERIFY_CHECKSUM}"
     REMOTE_DIR_NAME="${TEST_DIR_NAME}"; REMOTE_FILE_MODE="${TEST_FILE_MODE}"
+    REMOTE_DIR_MODE="${TEST_DIR_MODE}"
     REMOTE_LABEL="тест"; NOTIFY_REMOTE=""
 
     deliver_to_remote "${archive_dir}" copy
@@ -1219,7 +1231,7 @@ deliver_to_test() {
     REMOTE_RETENTION_DAYS="${s_days}"; REMOTE_KEEP_MIN="${s_keep}"
     REMOTE_XFER_TIMEOUT="${s_tmo}"; REMOTE_VERIFY_CHECKSUM="${s_sum}"
     REMOTE_LABEL="${s_label}"; NOTIFY_REMOTE="${s_notify}"; REMOTE_AUTH="${s_auth}"
-    REMOTE_DIR_NAME="${s_dirname}"; REMOTE_FILE_MODE="${s_mode}"
+    REMOTE_DIR_NAME="${s_dirname}"; REMOTE_FILE_MODE="${s_mode}"; REMOTE_DIR_MODE="${s_dmode}"
 }
 
 cleanup() {
