@@ -1031,10 +1031,15 @@ _remote_rotate() {
     out=$(_remote_ssh 300 "bash -s -- $(printf '%q %q %q' "${rdir}" "${REMOTE_RETENTION_DAYS}" "${REMOTE_KEEP_MIN}")" <<'ROTATE'
 dir="$1"; days="$2"; keep="$3"
 cd -- "$dir" 2>/dev/null || { echo 0; exit 0; }
+# Маска намеренно узкая: только то, что собрал этот скрипт. В плоском режиме
+# каталогом назначения может быть общий каталог, где лежат чужие архивы -
+# дистрибутивы платформы, выгрузки коллег. Правило "всё старше N дней" по
+# маске *.tar.gz вычистило бы и их.
+mask='*-backup-v*.tar.gz'
 # Список неприкосновенных: самые свежие по времени изменения.
-protected=$(ls -1t -- *.tar.gz 2>/dev/null | head -n "$keep")
+protected=$(ls -1t -- $mask 2>/dev/null | head -n "$keep")
 removed=0
-for f in $(find . -maxdepth 1 -type f -name '*.tar.gz' -mtime +"$days" -printf '%f\n' 2>/dev/null); do
+for f in $(find . -maxdepth 1 -type f -name "$mask" -mtime +"$days" -printf '%f\n' 2>/dev/null); do
     if printf '%s\n' "$protected" | grep -qxF -- "$f"; then
         continue
     fi
@@ -1063,16 +1068,35 @@ ROTATE
 #                начала бы копить архивы на боевом сервере.
 deliver_to_remote() {
     local archive_dir="$1" mode="${2:-store}"
-    # Имя папки внутри хранилища: заданное в настройках или имя хоста. Косая
-    # черта в имени запрещена - иначе значение из файла настроек могло бы
+    # Куда именно класть архивы внутри хранилища:
+    #   имя      - подпапка с этим именем, по ней различаются серверы;
+    #   пусто    - подпапка по имени хоста, поведение по умолчанию;
+    #   точка    - без подпапки, прямо в REMOTE_ROOT.
+    #
+    # Плоский режим нужен серверу-дублёру: он принимает архивы ровно с одного
+    # боевого сервера и разворачивает их скриптом, который ищет архив в заранее
+    # известном каталоге. Различать там серверы нечем и незачем, а лишний
+    # уровень вложенности пришлось бы обходить на приёмной стороне.
+    #
+    # Косая черта в имени запрещена: иначе значение из файла настроек могло бы
     # увести запись за пределы REMOTE_ROOT.
-    local dir_name="${REMOTE_DIR_NAME}"
+    local dir_name="${REMOTE_DIR_NAME}" rdir flat=0
     case "${dir_name}" in
-        */*) warn "${REMOTE_LABEL}: в имени папки '${dir_name}' есть '/', беру имя хоста"
-             dir_name="" ;;
+        .|./)
+            flat=1
+            rdir="${REMOTE_ROOT%/}"
+            ;;
+        */*)
+            warn "${REMOTE_LABEL}: в имени папки '${dir_name}' есть '/', беру имя хоста"
+            rdir="${REMOTE_ROOT%/}/$(hostname)"
+            ;;
+        "")
+            rdir="${REMOTE_ROOT%/}/$(hostname)"
+            ;;
+        *)
+            rdir="${REMOTE_ROOT%/}/${dir_name}"
+            ;;
     esac
-    [ -n "${dir_name}" ] || dir_name="$(hostname)"
-    local rdir="${REMOTE_ROOT%/}/${dir_name}"
 
     if [ -z "${REMOTE_HOST}" ]; then
         warn "--remote-store задан, но REMOTE_HOST пуст - доставка пропущена"
@@ -1086,13 +1110,19 @@ deliver_to_remote() {
     fi
 
     log "${REMOTE_LABEL}: ${REMOTE_USER}@${REMOTE_HOST}:${rdir}"
+    if [ "${flat}" = "1" ]; then
+        log "  ${REMOTE_LABEL}: без подпапки, архив кладётся прямо в этот каталог"
+    fi
     if ! _remote_ssh 60 "$(printf 'mkdir -p -- %q' "${rdir}")"; then
         warn "${REMOTE_LABEL}: сервер недоступен или каталог ${rdir} не создан, архив остался только локально"
         NOTIFY_REMOTE="ОШИБКА: ${REMOTE_HOST} недоступен, архив только локально"
         return 0
     fi
 
-    if [ -n "${REMOTE_DIR_MODE}" ]; then
+    # Права выставляются только на подпапку, которую скрипт сам и создал. В
+    # плоском режиме каталог назначения - чужой: он существовал до нас, в нём
+    # лежит что-то ещё, и менять на нём права мы не вправе.
+    if [ -n "${REMOTE_DIR_MODE}" ] && [ "${flat}" = "0" ]; then
         _remote_ssh 60 "$(printf 'chmod %s -- %q' "${REMOTE_DIR_MODE}" "${rdir}")" >/dev/null 2>&1 \
             || warn "${REMOTE_LABEL}: права ${REMOTE_DIR_MODE} на каталог выставить не удалось"
     fi
