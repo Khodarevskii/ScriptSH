@@ -544,11 +544,13 @@ check_http() {
     esac
 
     # Keycloak. Ответ на этот адрес означает, что жив и сам Keycloak, и его база:
-    # конфигурацию realm он читает из Postgres. Путь в разных сборках
-    # отличается, поэтому пробуем оба и принимаем тот, что ответил.
+    # конфигурацию realm он читает из Postgres. Первый путь - фактический для
+    # нашей сборки, он же используется в рабочем примере получения токена.
+    # Остальные оставлены на случай другой раскладки обратного прокси.
     local realm="${KEYCLOAK_REALM:-Visiology}"
     local u body found=0
-    for u in "${base}/auth/realms/${realm}/.well-known/openid-configuration" \
+    for u in "${base}/v3/keycloak/realms/${realm}/.well-known/openid-configuration" \
+             "${base}/auth/realms/${realm}/.well-known/openid-configuration" \
              "${base}/realms/${realm}/.well-known/openid-configuration"; do
         body=$(curl -sS -k -m "${HTTP_TIMEOUT}" "${u}" 2>/dev/null) || body=""
         if printf '%s' "${body}" | grep -q '"issuer"'; then
