@@ -318,8 +318,7 @@ tar -zcvf ${backup_file_dir}/${archive_name} -C ${backup_file_dir} backup
 
 echo "Backup completed successfully!"
 echo "Archive: ${backup_file_dir}/${archive_name}"
-user1@srv-stand:/$ ^C
-user1@srv-stand:/$ cat /var/lib/visiology/scripts/v3/restore.sh
+# --- ниже начинается restore.sh (файл собран из вывода двух скриптов) ---
 #!/bin/bash -e
 
 # Version 3.16.1
