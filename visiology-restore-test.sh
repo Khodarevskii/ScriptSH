@@ -472,12 +472,22 @@ check_postgres() {
              where table_schema not in ('pg_catalog','information_schema')" \
             2>/dev/null | tr -d '\r ')
         [ -n "${n}" ] || n=0
+        # Размер базы вместо подсчёта строк: пересчитывать строки во всех
+        # таблицах долго и незачем, а размер мгновенно показывает, лежат ли за
+        # схемой данные. Пустая схема после восстановления весит единицы
+        # мегабайт против гигабайтов у наполненной.
+        local size
+        size=$(sudo docker exec "${cid}" psql -U "${user}" -tAc \
+            "select pg_database_size('${db}')" 2>/dev/null | tr -d '\r ')
+        [ -n "${size}" ] || size=0
+
         if [ "${n}" -eq 0 ]; then
             check_fail "база ${db}: таблиц нет - восстановление не состоялось"
         else
-            check_ok "база ${db}: таблиц ${n}"
+            check_ok "база ${db}: таблиц ${n}, размер $(_human "${size}")"
         fi
         pg_summary="${pg_summary}pg:${db}=${n}"$'\n'
+        pg_summary="${pg_summary}pgsize:${db}=${size}"$'\n'
     done
     STATE_NOW="${STATE_NOW}${pg_summary}"
 }
@@ -511,6 +521,22 @@ check_clickhouse() {
         check_ok "база ${CH_DB}: таблиц ${n}"
     fi
     STATE_NOW="${STATE_NOW}ch:${CH_DB}=${n}"$'\n'
+
+    # Строки берутся из system.parts, а не count() по таблицам: это одна
+    # быстрая выборка из метаданных вместо обхода всех данных. Таблицы могут
+    # существовать пустыми - схема восстановилась, а данные нет, - и увидеть
+    # это можно только так.
+    local rows
+    rows=$(sudo docker exec "${cid}" clickhouse-client --query \
+        "SELECT sum(rows) FROM system.parts WHERE database = '${CH_DB}' AND active" \
+        2>/dev/null | tr -d '\r ')
+    [ -n "${rows}" ] || rows=0
+    if [ "${rows}" -eq 0 ]; then
+        check_fail "в базе ${CH_DB} таблицы есть, но строк нет - данные не восстановлены"
+    else
+        check_ok "база ${CH_DB}: строк ${rows}"
+    fi
+    STATE_NOW="${STATE_NOW}chrows:${CH_DB}=${rows}"$'\n'
 }
 
 ########################################
