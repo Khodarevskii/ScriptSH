@@ -3,8 +3,10 @@
 # visiology-restore-test.sh - разворачивает последнюю резервную копию и
 # проверяет, что платформа после этого действительно работает.
 #
-# Скрипт размещается рядом со штатным restore.sh: ему нужны config.env и
-# defaults.env, и сам restore.sh он вызывает из своего каталога.
+# Для восстановления скрипт должен лежать рядом со штатным restore.sh - он
+# вызывает его из своего каталога. Для одних только проверок (--tests-only)
+# место не имеет значения: config.env и defaults.env читаются, если лежат
+# рядом, а без них берутся значения по умолчанию, одинаковые на всех контурах.
 #
 # Зачем это нужно отдельным скриптом. Штатный restore.sh не проверяет результат
 # вообще: в нём нет set -e, у curl к backup-service нет ключа -f, а код возврата
@@ -122,25 +124,42 @@ done
 ########################################
 # Настройки платформы
 ########################################
-# Читаются те же два файла и тем же способом, что в backup.sh и restore.sh.
-# Своего файла настроек у этого скрипта нет намеренно: всё, что ему нужно, уже
-# описано в конфигурации платформы, а лишний источник правды означал бы, что
-# однажды они разойдутся.
-pushd "${SCRIPT_DIR}" >/dev/null || die "не удалось перейти в ${SCRIPT_DIR}"
-[ -f config.env ]   || die "в ${SCRIPT_DIR} нет config.env - скрипт должен лежать рядом с restore.sh"
-[ -f defaults.env ] || die "в ${SCRIPT_DIR} нет defaults.env - скрипт должен лежать рядом с restore.sh"
-# shellcheck disable=SC1091
-source config.env
-# shellcheck disable=SC1091
-source defaults.env
-popd >/dev/null || true
+# Если рядом лежат config.env и defaults.env платформы - берём значения оттуда.
+# Так их не приходится дублировать, и они не разойдутся с тем, чем пользуются
+# сами backup.sh и restore.sh.
+#
+# Но обязательными эти файлы не сделаны. Все нужные значения либо одинаковы на
+# всех контурах, либо определяются на месте, поэтому проверки можно гонять и с
+# копии скрипта, лежащей где угодно. Требовать конфигурацию платформы ради
+# пяти известных строк значило бы придумать себе лишний повод для отказа.
+if [ -f "${SCRIPT_DIR}/config.env" ]; then
+    pushd "${SCRIPT_DIR}" >/dev/null || die "не удалось перейти в ${SCRIPT_DIR}"
+    # shellcheck disable=SC1091
+    source config.env
+    # shellcheck disable=SC1091
+    [ -f defaults.env ] && source defaults.env
+    popd >/dev/null || true
+else
+    log "config.env рядом не найден, беру значения по умолчанию"
+fi
+
+# Имя стека спрашиваем у самого docker: он знает его точно, а совпадение с
+# config.env не гарантировано, если стек переименовывали.
+if [ -z "${PROJECT}" ]; then
+    PROJECT=$(sudo docker service ls --format '{{.Name}}' 2>/dev/null \
+              | grep -m1 '_' | cut -d_ -f1)
+    [ -n "${PROJECT}" ] && log "имя стека определено по docker: ${PROJECT}"
+fi
 
 : "${PROJECT:=visiology3}"
 : "${CH_DB:=visiology}"
-VERSION="${VI_VERSION:-3.16.1}"
+# Пустая версия отключает сверку версий: сверять не с чем.
+VERSION="${VI_VERSION:-}"
 RESTORE_SH="${SCRIPT_DIR}/restore.sh"
 
-[ -n "${BACKUP_DIR}" ] || die "в config.env не задан BACKUP_DIR"
+# Без BACKUP_DIR ищем архив там, где лежим. Место под распаковку проверяется
+# по тому же каталогу.
+[ -n "${BACKUP_DIR}" ] || BACKUP_DIR="${SCRIPT_DIR}"
 
 ########################################
 # Вспомогательное
@@ -201,7 +220,9 @@ preflight() {
     # версии платформы - это несколько часов работы и мусор в базах на выходе.
     local arch_ver
     arch_ver=$(basename -- "${ARCHIVE}" | sed -n 's/.*-backup-v\([0-9][0-9.]*\)-[0-9]\{4\}-.*/\1/p')
-    if [ -z "${arch_ver}" ]; then
+    if [ -z "${VERSION}" ]; then
+        log "  версия контура неизвестна (нет config.env), сверка версий пропущена"
+    elif [ -z "${arch_ver}" ]; then
         warn "не удалось определить версию из имени архива, проверка версии пропущена"
     elif [ "${arch_ver}" != "${VERSION}" ] && [ "${ANY_VERSION}" != "1" ]; then
         die "версия архива ${arch_ver} не совпадает с версией контура ${VERSION}.
@@ -243,7 +264,7 @@ confirm() {
     echo "  ЭТО ДЕЙСТВИЕ ЗАТРЁТ ДАННЫЕ ПЛАТФОРМЫ НА ЭТОМ СЕРВЕРЕ"
     echo
     echo "  сервер:   $(hostname)"
-    echo "  контур:   Visiology ${VERSION}, проект ${PROJECT}"
+    echo "  контур:   Visiology ${VERSION:-версия неизвестна}, проект ${PROJECT}"
     echo "  архив:    ${ARCHIVE}"
     echo "  размер:   $(_human "$(stat -c %s -- "${ARCHIVE}" 2>/dev/null || echo 0)")"
     if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
@@ -641,7 +662,7 @@ RESTORE_BAD_HTTP=""
 RESTORE_MARKERS=""
 
 log "=== начало ==="
-log "сервер: $(hostname), проект: ${PROJECT}, версия: ${VERSION}"
+log "сервер: $(hostname), проект: ${PROJECT}, версия: ${VERSION:-неизвестна}"
 
 if [ "${DO_RESTORE}" = "1" ]; then
     if [ -z "${ARCHIVE}" ]; then
