@@ -211,8 +211,37 @@ fi
 ########################################
 # Вспомогательное
 ########################################
+# Имя контейнера службы в Swarm: <служба>.<слот>.<идентификатор>. Точка после
+# имени службы обязательна в шаблоне, иначе фильтр по "..._postgres" поймает и
+# "..._postgres-visiology", и проверяться будет не та база.
 resolve_container() {
-    sudo docker ps --filter "name=$1" --format '{{.ID}}' 2>/dev/null | head -1
+    sudo docker ps --filter "name=^$1\\." --format '{{.ID}}' 2>/dev/null | head -1
+}
+
+# Все контейнеры платформы, чьё имя начинается с указанного шаблона.
+# Возвращает строки "идентификатор имя-службы". Узлов может быть несколько:
+# ClickHouse у вас развёрнут как clickhouse-1, баз Postgres тоже больше одной.
+_containers_like() {
+    local id name
+    for id in $(sudo docker ps --filter "name=^$1" --format '{{.ID}}' 2>/dev/null); do
+        name=$(sudo docker inspect --format '{{.Name}}' "${id}" 2>/dev/null | sed 's|^/||')
+        # Из "visiology3_clickhouse-1.1.abc" оставляем "visiology3_clickhouse-1"
+        printf '%s %s\n' "${id}" "${name%%.*}"
+    done
+}
+
+# Команда внутри контейнера с ограничением по времени. Без него прогон
+# подвисает намертво: psql, столкнувшись с требованием пароля, ждёт ввода,
+# которого в неинтерактивном запуске не будет никогда.
+_dexec() {
+    sudo timeout 30 docker exec "$@" 2>/dev/null
+}
+
+# Число реплик из docker: "1/1", но при ограничениях размещения - вида
+# "1/1 (max 1 per node)". Примечание в скобках нужно отрезать, иначе в "сколько
+# требуется" попадает текст и сравнение всегда даёт расхождение.
+_reps_clean() {
+    printf '%s' "${1%% *}"
 }
 
 _free_bytes() {
@@ -407,9 +436,10 @@ _services_raw() {
 
 # Сколько служб не набрали нужное число реплик.
 _services_pending() {
-    local line name reps run want pending=0
+    local name reps run want pending=0
     while IFS='|' read -r name reps; do
         [ -n "${name}" ] || continue
+        reps=$(_reps_clean "${reps}")
         run="${reps%%/*}"
         want="${reps##*/}"
         [ "${run}" = "${want}" ] || pending=$((pending + 1))
@@ -448,6 +478,7 @@ check_services() {
     while IFS='|' read -r name reps; do
         [ -n "${name}" ] || continue
         total=$((total + 1))
+        reps=$(_reps_clean "${reps}")
         run="${reps%%/*}"
         want="${reps##*/}"
         if [ "${run}" = "${want}" ] && [ "${run}" != "0" ]; then
@@ -507,57 +538,66 @@ check_health() {
 # так проверка не зависит от того, что записано в env-files на этой машине.
 check_postgres() {
     log "Postgres"
-    local cid user dbs db n
-    cid=$(resolve_container "${PROJECT}_postgres")
-    if [ -z "${cid}" ]; then
-        check_fail "контейнер ${PROJECT}_postgres не найден"
+    local found=0 cid cname
+    while read -r cid cname; do
+        [ -n "${cid}" ] || continue
+        found=1
+        _check_one_postgres "${cid}" "${cname}"
+    done < <(_containers_like "${PROJECT}_postgres")
+
+    [ "${found}" = "1" ] || check_fail "контейнеры ${PROJECT}_postgres* не найдены"
+}
+
+_check_one_postgres() {
+    local cid="$1" cname="$2" user dbs db n size
+
+    # Пользователь читается из окружения контейнера, а не угадывается. Заодно
+    # это признак того, что перед нами действительно Postgres: у чужого образа
+    # переменной не будет, и придираться к нему незачем.
+    user=$(_dexec "${cid}" printenv POSTGRES_USER | tr -d '\r\n')
+    if [ -z "${user}" ]; then
+        check_warn "${cname}: не похоже на Postgres (нет POSTGRES_USER), пропущен"
         return
     fi
 
-    user=$(sudo docker exec "${cid}" printenv POSTGRES_USER 2>/dev/null | tr -d '\r\n')
-    [ -n "${user}" ] || user="postgres"
-
-    if ! sudo docker exec "${cid}" psql -U "${user}" -tAc 'select 1' >/dev/null 2>&1; then
-        check_fail "Postgres не отвечает на запрос (пользователь ${user})"
+    # Ключ -w запрещает psql спрашивать пароль. Без него при парольном доступе
+    # он ждал бы ввода, которого в неинтерактивном запуске не будет никогда, и
+    # прогон висел бы до бесконечности.
+    if ! _dexec "${cid}" psql -w -U "${user}" -tAc 'select 1' >/dev/null; then
+        check_fail "${cname}: не отвечает на запрос (пользователь ${user})"
         return
     fi
-    check_ok "Postgres отвечает"
+    check_ok "${cname}: отвечает"
 
-    dbs=$(sudo docker exec "${cid}" psql -U "${user}" -tAc \
+    dbs=$(_dexec "${cid}" psql -w -U "${user}" -tAc \
         "select datname from pg_database where datistemplate = false and datname <> 'postgres'" \
-        2>/dev/null | tr -d '\r')
+        | tr -d '\r')
     if [ -z "${dbs}" ]; then
-        check_fail "в Postgres нет ни одной базы платформы"
+        check_fail "${cname}: нет ни одной базы платформы"
         return
     fi
 
-    # Пустая база после восстановления - главный признак того, что pg_restore
-    # не отработал, а backup-service промолчал.
-    local pg_summary=""
     for db in ${dbs}; do
-        n=$(sudo docker exec "${cid}" psql -U "${user}" -d "${db}" -tAc \
+        n=$(_dexec "${cid}" psql -w -U "${user}" -d "${db}" -tAc \
             "select count(*) from information_schema.tables
              where table_schema not in ('pg_catalog','information_schema')" \
-            2>/dev/null | tr -d '\r ')
+            | tr -d '\r ')
         [ -n "${n}" ] || n=0
-        # Размер базы вместо подсчёта строк: пересчитывать строки во всех
-        # таблицах долго и незачем, а размер мгновенно показывает, лежат ли за
-        # схемой данные. Пустая схема после восстановления весит единицы
-        # мегабайт против гигабайтов у наполненной.
-        local size
-        size=$(sudo docker exec "${cid}" psql -U "${user}" -tAc \
-            "select pg_database_size('${db}')" 2>/dev/null | tr -d '\r ')
+
+        # Размер вместо подсчёта строк: пересчитывать строки во всех таблицах
+        # долго и незачем, а размер сразу показывает, лежат ли за схемой данные.
+        size=$(_dexec "${cid}" psql -w -U "${user}" -tAc \
+            "select pg_database_size('${db}')" | tr -d '\r ')
         [ -n "${size}" ] || size=0
 
         if [ "${n}" -eq 0 ]; then
-            check_fail "база ${db}: таблиц нет - восстановление не состоялось"
+            check_fail "${cname}/${db}: таблиц нет - восстановление не состоялось"
         else
-            check_ok "база ${db}: таблиц ${n}, размер $(_human "${size}")"
+            check_ok "${cname}/${db}: таблиц ${n}, размер $(_human "${size}")"
         fi
-        pg_summary="${pg_summary}pg:${db}=${n}"$'\n'
-        pg_summary="${pg_summary}pgsize:${db}=${size}"$'\n'
+        STATE_NOW="${STATE_NOW}pg:${cname}/${db}=${n}"$'\n'
+        STATE_NOW="${STATE_NOW}pgsize:${cname}/${db}=${size}"$'\n'
     done
-    STATE_NOW="${STATE_NOW}${pg_summary}"
 }
 
 ########################################
@@ -567,51 +607,67 @@ check_postgres() {
 # два десятка таблиц при внешне успешном восстановлении.
 check_clickhouse() {
     log "ClickHouse"
-    local cid n
-    cid=$(resolve_container "${PROJECT}_clickhouse")
-    if [ -z "${cid}" ]; then
-        check_warn "контейнер ${PROJECT}_clickhouse не найден на этом хосте"
+    local found=0 cid cname
+    while read -r cid cname; do
+        [ -n "${cid}" ] || continue
+        found=1
+        _check_one_clickhouse "${cid}" "${cname}"
+    done < <(_containers_like "${PROJECT}_clickhouse")
+
+    [ "${found}" = "1" ] || check_warn "контейнеры ${PROJECT}_clickhouse* не найдены на этом хосте"
+}
+
+_check_one_clickhouse() {
+    local cid="$1" cname="$2" n rows
+
+    if ! _dexec "${cid}" clickhouse-client --query 'SELECT 1' >/dev/null; then
+        check_fail "${cname}: не отвечает на запрос"
         return
     fi
+    check_ok "${cname}: отвечает"
 
-    if ! sudo docker exec "${cid}" clickhouse-client --query 'SELECT 1' >/dev/null 2>&1; then
-        check_fail "ClickHouse не отвечает на запрос"
-        return
-    fi
-    check_ok "ClickHouse отвечает"
-
-    n=$(sudo docker exec "${cid}" clickhouse-client --query \
-        "SELECT count() FROM system.tables WHERE database = '${CH_DB}'" 2>/dev/null | tr -d '\r ')
+    n=$(_dexec "${cid}" clickhouse-client --query \
+        "SELECT count() FROM system.tables WHERE database = '${CH_DB}'" | tr -d '\r ')
     [ -n "${n}" ] || n=0
     if [ "${n}" -eq 0 ]; then
-        check_fail "в базе ${CH_DB} нет таблиц - данные не восстановлены"
+        check_fail "${cname}: в базе ${CH_DB} нет таблиц - данные не восстановлены"
     else
-        check_ok "база ${CH_DB}: таблиц ${n}"
+        check_ok "${cname}: таблиц ${n}"
     fi
-    STATE_NOW="${STATE_NOW}ch:${CH_DB}=${n}"$'\n'
+    STATE_NOW="${STATE_NOW}ch:${cname}=${n}"$'\n'
 
-    # Строки берутся из system.parts, а не count() по таблицам: это одна
-    # быстрая выборка из метаданных вместо обхода всех данных. Таблицы могут
-    # существовать пустыми - схема восстановилась, а данные нет, - и увидеть
-    # это можно только так.
-    local rows
-    rows=$(sudo docker exec "${cid}" clickhouse-client --query \
+    # Строки берутся из system.parts, а не count() по таблицам: это одна быстрая
+    # выборка из метаданных вместо обхода данных. Таблицы могут существовать
+    # пустыми - схема восстановилась, а данные нет.
+    rows=$(_dexec "${cid}" clickhouse-client --query \
         "SELECT sum(rows) FROM system.parts WHERE database = '${CH_DB}' AND active" \
-        2>/dev/null | tr -d '\r ')
+        | tr -d '\r ')
     [ -n "${rows}" ] || rows=0
     if [ "${rows}" -eq 0 ]; then
-        check_fail "в базе ${CH_DB} таблицы есть, но строк нет - данные не восстановлены"
+        check_fail "${cname}: таблицы есть, но строк нет - данные не восстановлены"
     else
-        check_ok "база ${CH_DB}: строк ${rows}"
+        check_ok "${cname}: строк ${rows}"
     fi
-    STATE_NOW="${STATE_NOW}chrows:${CH_DB}=${rows}"$'\n'
+    STATE_NOW="${STATE_NOW}chrows:${cname}=${rows}"$'\n'
 }
 
 ########################################
 # Проверка 5. Доступность по HTTP
 ########################################
+# Код ответа, либо 000, если ответа не было.
+#
+# Запасной вариант через || здесь не годится: при обрыве соединения curl и
+# печатает "000" по -w, и возвращает ненулевой код. Получалось "000000" - не
+# равное ни одному ожидаемому значению, из-за чего недоступная платформа
+# проходила проверку как исправная. Поэтому результат проверяется на вид, а не
+# на код возврата curl.
 _http_code() {
-    curl -sS -k -o /dev/null -m "${HTTP_TIMEOUT}" -w '%{http_code}' "$1" 2>/dev/null || echo "000"
+    local c
+    c=$(curl -sS -k -o /dev/null -m "${HTTP_TIMEOUT}" -w '%{http_code}' "$1" 2>/dev/null)
+    case "${c}" in
+        [0-9][0-9][0-9]) printf '%s' "${c}" ;;
+        *)               printf '000' ;;
+    esac
 }
 
 check_http() {
