@@ -17,7 +17,8 @@
 # состояние платформы проверяется независимо.
 #
 # Проверки: службы Swarm, состояние healthcheck контейнеров, живость и
-# наполнение Postgres и ClickHouse, отклик платформы по HTTP.
+# наполнение Postgres и ClickHouse, отклик платформы по HTTP и - если задан
+# --login-user - вход пользователя с получением настоящего токена.
 #
 # Коды возврата: 0 - всё прошло, 1 - есть отказавшие проверки, 2 - ошибка
 # запуска (не найден архив, отказ восстановления).
@@ -44,6 +45,18 @@ HTTP_TIMEOUT=15
 # Во сколько раз свободного места должно быть больше размера архива.
 # Восстановление распаковывает рядом каталог примерно того же объёма.
 SPACE_FACTOR_X10=25
+
+# Keycloak за обратным прокси лежит не по стандартному /auth и не по /realms.
+KEYCLOAK_PREFIX="/v3/keycloak"
+# Клиент и набор прав для проверки входа - как в рабочем примере получения
+# токена. Прямой вход по логину и паролю у этого клиента разрешён, браузер не
+# нужен.
+LOGIN_CLIENT="visiology_designer"
+LOGIN_SCOPE="openid data_management_service formula_engine workspace_service dashboard_service forms_service groups"
+
+LOGIN_USER=""
+LOGIN_PASSWORD=""
+PASSWORD_FILE=""
 
 ARCHIVE=""
 DO_RESTORE=1
@@ -91,6 +104,13 @@ print_help() {
                       по умолчанию https://127.0.0.1
       --wait СЕК      сколько ждать подъёма служб после восстановления
                       по умолчанию 900
+      --login-user ИМЯ    проверить, что этот пользователь может войти
+      --password-file ПУТЬ  файл с его паролем, первая строка
+
+Проверка входа выполняется, только если задан --login-user. Пароль берётся из
+файла, из переменной окружения VIS_PASSWORD или спрашивается с клавиатуры.
+Аргументом командной строки пароль не принимается: аргументы процесса видны в
+выводе ps любому пользователю системы.
 
 Всё, что указано после --, передаётся штатному restore.sh без изменений:
 
@@ -115,6 +135,8 @@ while [ "$1" != "" ]; do
         --any-version) ANY_VERSION=1 ;;
         --url)         shift; HTTP_URL="$1" ;;
         --wait)        shift; WAIT_SERVICES="$1" ;;
+        --login-user)  shift; LOGIN_USER="$1" ;;
+        --password-file) shift; PASSWORD_FILE="$1" ;;
         --)            shift; EXTRA_ARGS=("$@"); break ;;
         *)             echo "Неизвестный ключ: $1" >&2; print_help; exit 2 ;;
     esac
@@ -160,6 +182,31 @@ RESTORE_SH="${SCRIPT_DIR}/restore.sh"
 # Без BACKUP_DIR ищем архив там, где лежим. Место под распаковку проверяется
 # по тому же каталогу.
 [ -n "${BACKUP_DIR}" ] || BACKUP_DIR="${SCRIPT_DIR}"
+
+# Пароль для проверки входа. Три источника, по убыванию удобства для расписания:
+# файл, окружение, клавиатура. Аргументом командной строки пароль не
+# принимается - аргументы процесса видны в выводе ps любому пользователю.
+if [ -n "${LOGIN_USER}" ]; then
+    if [ -n "${PASSWORD_FILE}" ]; then
+        [ -r "${PASSWORD_FILE}" ] || die "файл с паролем недоступен для чтения: ${PASSWORD_FILE}"
+        # Права проверяем, но не правим: файл чужой, и молча менять на него
+        # права - хуже, чем предупредить.
+        _pmode=$(stat -c %a -- "${PASSWORD_FILE}" 2>/dev/null)
+        case "${_pmode}" in
+            600|400) ;;
+            *) warn "у ${PASSWORD_FILE} права ${_pmode}, пароль доступен посторонним. Нужно: chmod 600" ;;
+        esac
+        LOGIN_PASSWORD=$(head -n1 -- "${PASSWORD_FILE}" | tr -d '\r\n')
+    elif [ -n "${VIS_PASSWORD}" ]; then
+        LOGIN_PASSWORD="${VIS_PASSWORD}"
+    elif [ -t 0 ]; then
+        printf "Пароль для %s: " "${LOGIN_USER}" >&2
+        read -r -s LOGIN_PASSWORD
+        printf "\n" >&2
+    fi
+    [ -n "${LOGIN_PASSWORD}" ] \
+        || die "для проверки входа нужен пароль ${LOGIN_USER}: --password-file, VIS_PASSWORD или ввод с клавиатуры"
+fi
 
 ########################################
 # Вспомогательное
@@ -596,7 +643,7 @@ check_http() {
     # Остальные оставлены на случай другой раскладки обратного прокси.
     local realm="${KEYCLOAK_REALM:-Visiology}"
     local u body found=0
-    for u in "${base}/v3/keycloak/realms/${realm}/.well-known/openid-configuration" \
+    for u in "${base}${KEYCLOAK_PREFIX}/realms/${realm}/.well-known/openid-configuration" \
              "${base}/auth/realms/${realm}/.well-known/openid-configuration" \
              "${base}/realms/${realm}/.well-known/openid-configuration"; do
         body=$(curl -sS -k -m "${HTTP_TIMEOUT}" "${u}" 2>/dev/null) || body=""
@@ -607,6 +654,87 @@ check_http() {
         fi
     done
     [ "${found}" = "1" ] || check_fail "Keycloak не отдал конфигурацию realm ${realm} - проверьте его и его базу"
+}
+
+########################################
+# Проверка 6. Вход пользователя
+########################################
+# Проверка Keycloak выше подтверждает, что служба жива и её база читается. Это
+# не то же самое, что "учётная запись работает": realm может отдаваться, а вход
+# не проходить - например, когда восстановилась база платформы, но не база
+# Keycloak. Здесь берётся настоящий токен и проверяется, что платформа его
+# принимает.
+#
+# Выполняется, только если задано имя пользователя. Без него молча
+# пропускается: остальным проверкам секреты не нужны, и навязывать их хранение
+# ради одной было бы неправильно.
+check_login() {
+    [ -n "${LOGIN_USER}" ] || return 0
+    log "вход пользователя"
+
+    if ! command -v curl >/dev/null 2>&1; then
+        check_warn "curl не установлен, проверка входа пропущена"
+        return
+    fi
+
+    local base="${HTTP_URL}"
+    [ -n "${base}" ] || base="https://127.0.0.1"
+    base="${base%/}"
+    local realm="${KEYCLOAK_REALM:-Visiology}"
+    local kc="${base}${KEYCLOAK_PREFIX}/realms/${realm}/protocol/openid-connect"
+
+    # Пароль уходит в curl через файл, а не аргументом: аргументы процесса
+    # видны в ps. По той же причине токен передаётся файлом настроек curl, а не
+    # ключом -H.
+    local pfile
+    pfile=$(mktemp) || { check_warn "не создать временный файл, проверка входа пропущена"; return; }
+    chmod 600 "${pfile}"
+    printf '%s' "${LOGIN_PASSWORD}" > "${pfile}"
+
+    local body
+    body=$(curl -sS -k -m "${HTTP_TIMEOUT}" -X POST "${kc}/token" \
+        --data-urlencode "client_id=${LOGIN_CLIENT}" \
+        --data-urlencode "grant_type=password" \
+        --data-urlencode "scope=${LOGIN_SCOPE}" \
+        --data-urlencode "username=${LOGIN_USER}" \
+        --data-urlencode "password@${pfile}" 2>/dev/null)
+    rm -f "${pfile}"
+
+    # Пробелы вокруг двоеточия допускаются: форматирование ответа - дело
+    # отдающей стороны, и завязываться на его отсутствие нельзя.
+    local token
+    token=$(printf '%s' "${body}" \
+        | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [ -z "${token}" ]; then
+        local hint=""
+        case "${body}" in
+            *unauthorized_client*) hint=" - у клиента ${LOGIN_CLIENT} выключен прямой вход (Direct Access Grants)" ;;
+            *invalid_grant*)       hint=" - неверный логин или пароль, либо учётная запись отключена" ;;
+            *invalid_scope*)       hint=" - клиенту не выданы запрошенные права" ;;
+            "")                    hint=" - Keycloak не ответил" ;;
+        esac
+        check_fail "вход ${LOGIN_USER}: токен не получен${hint}"
+        [ -n "${body}" ] && echo "               ответ: $(printf '%s' "${body}" | head -c 200)"
+        return
+    fi
+    check_ok "вход ${LOGIN_USER}: токен получен"
+
+    # Токен выдан - ещё не значит, что он принимается. Отклоняемый токен виден
+    # только на запросе с ним.
+    local cfg code
+    cfg=$(mktemp) || { check_warn "не создать временный файл, приём токена не проверен"; return; }
+    chmod 600 "${cfg}"
+    printf 'header = "Authorization: Bearer %s"\n' "${token}" > "${cfg}"
+    code=$(curl -sS -k -m "${HTTP_TIMEOUT}" -o /dev/null -w '%{http_code}' \
+        -K "${cfg}" "${kc}/userinfo" 2>/dev/null) || code="000"
+    rm -f "${cfg}"
+
+    if [ "${code}" = "200" ]; then
+        check_ok "токен принимается платформой"
+    else
+        check_fail "токен выдан, но платформой не принимается: userinfo вернул ${code}"
+    fi
 }
 
 ########################################
@@ -692,6 +820,7 @@ if [ "${DO_TESTS}" = "1" ]; then
     check_postgres
     check_clickhouse
     check_http
+    check_login
     echo
     compare_state
 else
