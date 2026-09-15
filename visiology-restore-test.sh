@@ -62,9 +62,6 @@ LOGIN_USER=""
 LOGIN_PASSWORD=""
 PASSWORD_FILE=""
 
-# Дополнительные ключи curl. Заполняются при определении адреса платформы.
-CURL_EXTRA=()
-
 ARCHIVE=""
 DO_RESTORE=1
 DO_TESTS=1
@@ -107,9 +104,8 @@ print_help() {
       --yes           не спрашивать подтверждения (для неинтерактивного запуска)
       --any-version   развернуть архив от другой версии платформы
                       несовпадение станет замечанием вместо отказа
-      --url АДРЕС     базовый адрес для HTTP-проверок. По умолчанию имя
-                      площадки берётся из конфигурации nginx платформы, а
-                      соединение всё равно идёт на 127.0.0.1
+      --url АДРЕС     базовый адрес для HTTP-проверок
+                      по умолчанию 127.0.0.1, сначала https, затем http
       --wait СЕК      сколько ждать подъёма служб после восстановления
                       по умолчанию 900
       --ignore СПИСОК не проверять эти службы, через запятую и без префикса
@@ -776,74 +772,11 @@ _check_one_clickhouse() {
 # на код возврата curl.
 _http_code() {
     local c
-    c=$(curl -sS -k "${CURL_EXTRA[@]}" -o /dev/null -m "${HTTP_TIMEOUT}" -w '%{http_code}' "$1" 2>/dev/null)
+    c=$(curl -sS -k -o /dev/null -m "${HTTP_TIMEOUT}" -w '%{http_code}' "$1" 2>/dev/null)
     case "${c}" in
         [0-9][0-9][0-9]) printf '%s' "${c}" ;;
         *)               printf '000' ;;
     esac
-}
-
-# Выбор доменного имени из текста конфигурации nginx.
-_pick_server_name() {
-    sed -n 's/^[[:space:]]*server_name[[:space:]]\{1,\}\([^;]*\);.*/\1/p' \
-        | tr ' ' '\n' | tr -d '\r' \
-        | grep -vE '^(_|localhost|\*|)$' | head -1
-}
-
-# Имя площадки из конфигурации платформы. Файлы nginx у Visiology не пишутся
-# руками, а порождаются prepare-config.sh из config.env - значит адрес есть и
-# там, причём в виде, не зависящем от того, как устроен контейнер прокси.
-# Ключ не угадываем: берём первое значение, похожее на доменное имя, отбрасывая
-# адреса реестров образов и почтовые.
-_domain_from_config() {
-    local f
-    for f in "${SCRIPT_DIR}/config.env" "${SCRIPT_DIR}/defaults.env"; do
-        [ -f "${f}" ] || continue
-        sed -n 's/^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=//p' "${f}" 2>/dev/null \
-            | tr -d '"'"'"'\r' \
-            | sed 's|^https\?://||; s|/.*$||' \
-            | grep -oE '^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$' \
-            | grep -vE '^(cr\.|.*\.docker\.|.*registry.*)' \
-            | grep -vE '@' \
-            | head -1
-    done | head -1
-}
-
-# Доменное имя площадки. Обращаться к 127.0.0.1 бесполезно: nginx раздаёт по
-# виртуальному хосту и на запрос без правильного имени отвечает не тем или не
-# отвечает вовсе.
-#
-# Источники по убыванию достоверности: действующая конфигурация nginx внутри
-# контейнера прокси, затем его файлы конфигурации напрямую (nginx -T есть не в
-# каждой сборке), затем конфигурация платформы.
-_nginx_server_name() {
-    local svc cid name cids=""
-
-    # Сначала вероятные имена, затем все остальные контейнеры платформы: имя
-    # службы прокси в разных сборках отличается.
-    for svc in edge reverse-proxy nginx proxy gateway; do
-        cid=$(resolve_container "${PROJECT}_${svc}")
-        [ -n "${cid}" ] && cids="${cids} ${cid}"
-    done
-    cids="${cids} $(sudo docker ps --filter "name=^${PROJECT}_" --format '{{.ID}}' 2>/dev/null | tr '\n' ' ')"
-
-    local seen=" "
-    for cid in ${cids}; do
-        case "${seen}" in *" ${cid} "*) continue ;; esac
-        seen="${seen}${cid} "
-
-        name=$(sudo timeout 15 docker exec "${cid}" nginx -T 2>/dev/null | _pick_server_name)
-        [ -n "${name}" ] && { printf '%s' "${name}"; return 0; }
-
-        name=$(sudo timeout 15 docker exec "${cid}" sh -c \
-                'cat /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* 2>/dev/null' \
-                2>/dev/null | _pick_server_name)
-        [ -n "${name}" ] && { printf '%s' "${name}"; return 0; }
-    done
-
-    name=$(_domain_from_config)
-    [ -n "${name}" ] && { printf '%s' "${name}"; return 0; }
-    return 1
 }
 
 check_http() {
@@ -854,22 +787,15 @@ check_http() {
         return
     fi
 
-    local bases=() dom=""
+    # Обращаться к 127.0.0.1 правильно: nginx платформы объявлен как
+    # default_server и отвечает на запрос с любым именем в заголовке, поэтому
+    # виртуальных хостов, под которые нужно подстраиваться, здесь нет.
+    # Проверять нужно именно эту машину, а не то, куда указывает внешний DNS.
+    local bases=()
     if [ -n "${HTTP_URL}" ]; then
         bases=("${HTTP_URL%/}")
     else
-        dom=$(_nginx_server_name) || dom=""
-        if [ -n "${dom}" ]; then
-            # Соединение всё равно идёт на локальный адрес: имя может не
-            # разрешаться на самом сервере, а проверять нужно именно эту машину,
-            # а не то, куда указывает внешний DNS.
-            CURL_EXTRA=(--resolve "${dom}:443:127.0.0.1" --resolve "${dom}:80:127.0.0.1")
-            bases=("https://${dom}" "http://${dom}")
-            log "  имя площадки: ${dom} (соединение на 127.0.0.1)"
-        else
-            bases=("https://127.0.0.1" "http://127.0.0.1")
-            log "  имя площадки не найдено ни в nginx, ни в config.env - пробую 127.0.0.1"
-        fi
+        bases=("https://127.0.0.1" "http://127.0.0.1")
     fi
 
     local base="" code="" b err
@@ -881,7 +807,7 @@ check_http() {
     if [ -z "${base}" ]; then
         # Причину печатает сам curl - без неё непонятно, отказ ли это в
         # соединении, неверное имя или истёкшее время ожидания.
-        err=$(curl -sS -k "${CURL_EXTRA[@]}" -o /dev/null -m "${HTTP_TIMEOUT}" "${bases[0]}/" 2>&1 | head -1)
+        err=$(curl -sS -k -o /dev/null -m "${HTTP_TIMEOUT}" "${bases[0]}/" 2>&1 | head -1)
         check_fail "${bases[0]}/ - нет ответа: ${err:-причина не сообщена}"
         check_warn "Keycloak не проверялся: платформа не отвечает по HTTP"
         return
@@ -902,7 +828,7 @@ check_http() {
     for u in "${base}${KEYCLOAK_PREFIX}/realms/${realm}/.well-known/openid-configuration" \
              "${base}/auth/realms/${realm}/.well-known/openid-configuration" \
              "${base}/realms/${realm}/.well-known/openid-configuration"; do
-        body=$(curl -sS -k "${CURL_EXTRA[@]}" -m "${HTTP_TIMEOUT}" "${u}" 2>/dev/null) || body=""
+        body=$(curl -sS -k -m "${HTTP_TIMEOUT}" "${u}" 2>/dev/null) || body=""
         last=$(_http_code "${u}")
         if printf '%s' "${body}" | grep -q '"issuer"'; then
             check_ok "Keycloak отдаёт конфигурацию realm ${realm}"
@@ -950,7 +876,7 @@ check_login() {
     printf '%s' "${LOGIN_PASSWORD}" > "${pfile}"
 
     local body
-    body=$(curl -sS -k "${CURL_EXTRA[@]}" -m "${HTTP_TIMEOUT}" -X POST "${kc}/token" \
+    body=$(curl -sS -k -m "${HTTP_TIMEOUT}" -X POST "${kc}/token" \
         --data-urlencode "client_id=${LOGIN_CLIENT}" \
         --data-urlencode "grant_type=password" \
         --data-urlencode "scope=${LOGIN_SCOPE}" \
@@ -984,7 +910,7 @@ check_login() {
     cfg=$(mktemp) || { check_warn "не создать временный файл, приём токена не проверен"; return; }
     chmod 600 "${cfg}"
     printf 'header = "Authorization: Bearer %s"\n' "${token}" > "${cfg}"
-    code=$(curl -sS -k "${CURL_EXTRA[@]}" -m "${HTTP_TIMEOUT}" -o /dev/null -w '%{http_code}' \
+    code=$(curl -sS -k -m "${HTTP_TIMEOUT}" -o /dev/null -w '%{http_code}' \
         -K "${cfg}" "${kc}/userinfo" 2>/dev/null) || code="000"
     rm -f "${cfg}"
 
