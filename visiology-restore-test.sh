@@ -264,9 +264,12 @@ _containers_like() {
 # POSTGRES_PASSWORD в окружении может не быть вовсе, а быть POSTGRES_USER_FILE.
 _container_value() {
     local cid="$1"; shift
-    local k v path env_dump
+    local k v path env_dump secrets
     env_dump=$(sudo timeout 10 docker inspect \
         --format '{{range .Config.Env}}{{println .}}{{end}}' "${cid}" 2>/dev/null)
+    # Список секретов берём один раз: обращение в контейнер небесплатно, а
+    # ключей проверяется несколько.
+    secrets=$(sudo timeout 10 docker exec "${cid}" sh -c 'ls -1 /run/secrets/ 2>/dev/null' 2>/dev/null)
 
     for k in "$@"; do
         v=$(printf '%s\n' "${env_dump}" | sed -n "s/^${k}=//p" | head -1 | tr -d '\r')
@@ -275,6 +278,15 @@ _container_value() {
         path=$(printf '%s\n' "${env_dump}" | sed -n "s/^${k}_FILE=//p" | head -1 | tr -d '\r')
         if [ -n "${path}" ]; then
             v=$(sudo timeout 10 docker exec "${cid}" cat -- "${path}" 2>/dev/null \
+                | head -1 | tr -d '\r\n')
+            [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+        fi
+
+        # Swarm монтирует секреты в /run/secrets под их собственными именами.
+        # Переменной, указывающей на них, может не быть вовсе - тогда остаётся
+        # только совпадение имени секрета с именем искомой настройки.
+        if printf '%s\n' "${secrets}" | grep -qxF -- "${k}" 2>/dev/null; then
+            v=$(sudo timeout 10 docker exec "${cid}" cat -- "/run/secrets/${k}" 2>/dev/null \
                 | head -1 | tr -d '\r\n')
             [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
         fi
