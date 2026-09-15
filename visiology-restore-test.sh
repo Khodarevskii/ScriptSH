@@ -55,6 +55,21 @@ KEYCLOAK_PREFIX="/v3/keycloak"
 LOGIN_CLIENT="visiology_designer"
 LOGIN_SCOPE="openid data_management_service formula_engine workspace_service dashboard_service forms_service groups"
 
+# Гасить ли прикладные службы на время восстановления.
+#
+# Штатный restore.sh этого не делает: платформа продолжает писать в базы, пока
+# pg_restore их наполняет. Отсюда нарушения внешних ключей Hangfire и
+# недовосстановленные таблицы ClickHouse при внешне успешном прогоне.
+STOP_SERVICES=0
+
+# Службы, которые остаются работать при --stop-services. Это слой данных (без
+# него восстанавливать некуда), сама машинерия восстановления и наблюдение,
+# которое в базы платформы не пишет. Сопоставление по вхождению подстроки.
+KEEP_RUNNING="postgres clickhouse smart-forms-db etl-db minio backup-service jdbc-bridge cadvisor node-exporter otelcol promtail prometheus loki tempo"
+
+# Здесь запоминается, сколько реплик было у каждой погашенной службы.
+SERVICES_STATE_FILE="/var/tmp/visiology-restore-test.services"
+
 # Службы, которые не проверяются: отключены осознанно и их состояние ни о чём
 # не говорит. Список через запятую, имена без префикса проекта.
 IGNORE_SERVICES=""
@@ -109,6 +124,10 @@ print_help() {
                       по умолчанию 127.0.0.1, сначала https, затем http
       --wait СЕК      сколько ждать подъёма служб после восстановления
                       по умолчанию 900
+      --stop-services погасить прикладные службы перед восстановлением и
+                      поднять после. Слой данных при этом работает
+      --keep-running СПИСОК  что не гасить, через запятую; по умолчанию базы,
+                      backup-service и службы наблюдения
       --ignore СПИСОК не проверять эти службы, через запятую и без префикса
                       проекта: --ignore prometheus,grafana
       --login-user ИМЯ    проверить, что этот пользователь может войти
@@ -142,6 +161,8 @@ while [ "$1" != "" ]; do
         --any-version) ANY_VERSION=1 ;;
         --url)         shift; HTTP_URL="$1" ;;
         --wait)        shift; WAIT_SERVICES="$1" ;;
+        --stop-services) STOP_SERVICES=1 ;;
+        --keep-running) shift; KEEP_RUNNING=$(printf '%s' "$1" | tr ',' ' ') ;;
         --ignore)      shift; IGNORE_SERVICES="$1" ;;
         --login-user)  shift; LOGIN_USER="$1" ;;
         --password-file) shift; PASSWORD_FILE="$1" ;;
@@ -436,6 +457,11 @@ confirm() {
     echo "  контур:   Visiology ${VERSION:-версия неизвестна}, проект ${PROJECT}"
     echo "  архив:    ${ARCHIVE}"
     echo "  размер:   $(_human "$(stat -c %s -- "${ARCHIVE}" 2>/dev/null || echo 0)")"
+    if [ "${STOP_SERVICES}" = "1" ]; then
+        echo "  службы:   прикладные будут погашены и подняты после"
+    else
+        echo "  службы:   останутся работать - как делает штатный restore.sh"
+    fi
     if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
         echo "  доп.ключи restore.sh: ${EXTRA_ARGS[*]}"
     fi
@@ -560,6 +586,89 @@ wait_services() {
         log "  ещё поднимаются: ${pending}, осталось ждать ${left} с"
         sleep 30
     done
+}
+
+########################################
+# Остановка и подъём прикладных служб
+########################################
+# Остаётся ли служба работать.
+_keep_running() {
+    local name="$1" pat
+    for pat in ${KEEP_RUNNING}; do
+        case "${name}" in *"${pat}"*) return 0 ;; esac
+    done
+    return 1
+}
+
+# Дождаться, пока у погашенных служб не останется ни одного контейнера.
+# Масштабирование в ноль возвращает управление сразу, а задачи умирают не
+# мгновенно - и пока жив хоть один, он продолжает писать в базу.
+_wait_stopped() {
+    local deadline left name alive
+    deadline=$(( $(date +%s) + 300 ))
+    while :; do
+        alive=0
+        while IFS='=' read -r name _; do
+            [ -n "${name}" ] || continue
+            [ -n "$(sudo docker ps --filter "name=^${name}\\." --format '{{.ID}}' 2>/dev/null)" ] \
+                && alive=$((alive + 1))
+        done < "${SERVICES_STATE_FILE}"
+
+        [ "${alive}" -eq 0 ] && return 0
+        left=$(( deadline - $(date +%s) ))
+        if [ "${left}" -le 0 ]; then
+            warn "через 300 с ещё живы контейнеры: ${alive}. Восстановление продолжится, но они могут писать в базы"
+            return 1
+        fi
+        log "  ещё останавливаются: ${alive}"
+        sleep 10
+    done
+}
+
+stop_services() {
+    local name reps want stopped=0 kept=0
+    log "останавливаю прикладные службы"
+    : > "${SERVICES_STATE_FILE}" || { warn "не создать ${SERVICES_STATE_FILE}, службы не трогаю"; return 1; }
+
+    while IFS='|' read -r name reps; do
+        [ -n "${name}" ] || continue
+        reps=$(_reps_clean "${reps}")
+        want="${reps##*/}"
+        # Уже выключенные не трогаем: иначе подняли бы то, что выключено намеренно.
+        [ "${want}" = "0" ] && continue
+        if _keep_running "${name}"; then
+            kept=$((kept + 1))
+            continue
+        fi
+        # Число реплик записывается до остановки: иначе восстанавливать будет нечем.
+        printf '%s=%s\n' "${name}" "${want}" >> "${SERVICES_STATE_FILE}"
+        if sudo timeout 120 docker service scale --detach "${name}=0" >/dev/null 2>&1; then
+            stopped=$((stopped + 1))
+        else
+            warn "не удалось остановить ${name}"
+        fi
+    done < <(_services_raw)
+
+    log "  остановлено: ${stopped}, оставлено работать: ${kept}"
+    [ "${stopped}" -gt 0 ] || return 0
+    _wait_stopped
+    return 0
+}
+
+start_services() {
+    [ -s "${SERVICES_STATE_FILE}" ] || return 0
+    local name want started=0
+    log "поднимаю службы обратно"
+    while IFS='=' read -r name want; do
+        [ -n "${name}" ] || continue
+        if sudo timeout 120 docker service scale --detach "${name}=${want}" >/dev/null 2>&1; then
+            started=$((started + 1))
+        else
+            warn "не удалось поднять ${name} (нужно ${want} реплик) - поднимите вручную"
+        fi
+    done < "${SERVICES_STATE_FILE}"
+    log "  возвращено служб: ${started}"
+    rm -f "${SERVICES_STATE_FILE}"
 }
 
 ########################################
@@ -1076,7 +1185,24 @@ if [ "${DO_RESTORE}" = "1" ]; then
 
     preflight
     confirm
+
+    if [ "${STOP_SERVICES}" = "1" ]; then
+        # Подъём служб должен произойти при любом исходе - при ошибке
+        # восстановления, при прерывании с клавиатуры, при падении скрипта.
+        # Иначе платформа останется лежать, и это будет хуже неудачного
+        # восстановления.
+        trap 'echo; warn "прервано - поднимаю службы"; start_services; exit 130' INT TERM
+        trap 'start_services' EXIT
+        stop_services
+    fi
+
     run_restore
+
+    if [ "${STOP_SERVICES}" = "1" ]; then
+        start_services
+        trap - EXIT INT TERM
+    fi
+
     wait_services || true
 else
     log "восстановление пропущено (--tests-only)"
