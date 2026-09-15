@@ -175,8 +175,10 @@ fi
 
 : "${PROJECT:=visiology3}"
 : "${CH_DB:=visiology}"
-# Пустая версия отключает сверку версий: сверять не с чем.
-VERSION="${VI_VERSION:-}"
+# Так же, как в backup.sh: из конфигов, иначе то же запасное значение. Архивы
+# именуются этой величиной, поэтому сверка имеет смысл только при совпадающем
+# источнике.
+VERSION="${VI_VERSION:-3.16.1}"
 RESTORE_SH="${SCRIPT_DIR}/restore.sh"
 
 # Без BACKUP_DIR ищем архив там, где лежим. Место под распаковку проверяется
@@ -228,6 +230,26 @@ _containers_like() {
         # Из "visiology3_clickhouse-1.1.abc" оставляем "visiology3_clickhouse-1"
         printf '%s %s\n' "${id}" "${name%%.*}"
     done
+}
+
+# Значение первой найденной переменной из списка. Сначала смотрим окружение
+# самого контейнера, затем env-files платформы - тот самый каталог, который
+# backup.sh складывает в архив, там и живут учётные данные баз.
+_find_env_value() {
+    local cid="$1"; shift
+    local k v
+    for k in "$@"; do
+        v=$(sudo timeout 10 docker inspect \
+                --format '{{range .Config.Env}}{{println .}}{{end}}' "${cid}" 2>/dev/null \
+            | sed -n "s/^${k}=//p" | head -1 | tr -d '\r')
+        [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+    done
+    for k in "$@"; do
+        v=$(grep -rhs "^[[:space:]]*${k}=" "${SCRIPT_DIR}/env-files/" 2>/dev/null \
+            | head -1 | cut -d= -f2- | tr -d '"'"'"'\r')
+        [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+    done
+    return 1
 }
 
 # Команда внутри контейнера с ограничением по времени. Без него прогон
@@ -548,28 +570,60 @@ check_postgres() {
     [ "${found}" = "1" ] || check_fail "контейнеры ${PROJECT}_postgres* не найдены"
 }
 
+# Запрос к Postgres выбранным способом. Пароль передаётся через стандартный
+# ввод, а не аргументом docker: иначе он попал бы в argv и был бы виден в ps.
+_pgq() {
+    local cid="$1" db="$2" q="$3"
+    if [ -n "${PG_PASS}" ]; then
+        printf '%s' "${PG_PASS}" | sudo timeout 30 docker exec -i "${cid}" \
+            sh -c 'PGPASSWORD=$(cat) exec psql -w -U "$1" -d "$2" -tAc "$3"' \
+            sh "${PG_USER}" "${db}" "${q}" 2>&1
+    elif [ "${PG_ASUSER}" = "1" ]; then
+        sudo timeout 30 docker exec -u postgres "${cid}" \
+            psql -w -U "${PG_USER}" -d "${db}" -tAc "${q}" 2>&1
+    else
+        sudo timeout 30 docker exec "${cid}" \
+            psql -w -U "${PG_USER}" -d "${db}" -tAc "${q}" 2>&1
+    fi
+}
+
+# Подбор рабочего способа подключения. Перебираются варианты по убыванию
+# определённости: учётные данные из окружения и env-files, затем вход
+# суперпользователем, затем от системного пользователя postgres внутри
+# контейнера - при локальном подключении по сокету пароль обычно не требуется.
+_pg_connect() {
+    local cid="$1" u p
+    u=$(_find_env_value "${cid}" POSTGRES_USER PGUSER POSTGRESQL_USERNAME DB_USER) || u=""
+    p=$(_find_env_value "${cid}" POSTGRES_PASSWORD PGPASSWORD POSTGRESQL_PASSWORD DB_PASSWORD) || p=""
+
+    PG_USER="${u:-postgres}"; PG_PASS="${p}"; PG_ASUSER=0
+    _pgq "${cid}" postgres 'select 1' | grep -q '^1$' && return 0
+
+    PG_PASS=""
+    _pgq "${cid}" postgres 'select 1' | grep -q '^1$' && return 0
+
+    PG_USER="postgres"
+    _pgq "${cid}" postgres 'select 1' | grep -q '^1$' && return 0
+
+    PG_ASUSER=1
+    _pgq "${cid}" postgres 'select 1' | grep -q '^1$' && return 0
+
+    return 1
+}
+
 _check_one_postgres() {
-    local cid="$1" cname="$2" user dbs db n size
+    local cid="$1" cname="$2" dbs db n size out
 
-    # Пользователь читается из окружения контейнера, а не угадывается. Заодно
-    # это признак того, что перед нами действительно Postgres: у чужого образа
-    # переменной не будет, и придираться к нему незачем.
-    user=$(_dexec "${cid}" printenv POSTGRES_USER | tr -d '\r\n')
-    if [ -z "${user}" ]; then
-        check_warn "${cname}: не похоже на Postgres (нет POSTGRES_USER), пропущен"
+    if ! _pg_connect "${cid}"; then
+        # Показываем, что именно ответил psql: "не отвечает" без причины
+        # заставляет лезть в контейнер руками.
+        out=$(_pgq "${cid}" postgres 'select 1' | head -2 | tr '\n' ' ')
+        check_fail "${cname}: подключиться не удалось. Ответ: ${out:-пусто}"
         return
     fi
+    check_ok "${cname}: отвечает (пользователь ${PG_USER})"
 
-    # Ключ -w запрещает psql спрашивать пароль. Без него при парольном доступе
-    # он ждал бы ввода, которого в неинтерактивном запуске не будет никогда, и
-    # прогон висел бы до бесконечности.
-    if ! _dexec "${cid}" psql -w -U "${user}" -tAc 'select 1' >/dev/null; then
-        check_fail "${cname}: не отвечает на запрос (пользователь ${user})"
-        return
-    fi
-    check_ok "${cname}: отвечает"
-
-    dbs=$(_dexec "${cid}" psql -w -U "${user}" -tAc \
+    dbs=$(_pgq "${cid}" postgres \
         "select datname from pg_database where datistemplate = false and datname <> 'postgres'" \
         | tr -d '\r')
     if [ -z "${dbs}" ]; then
@@ -578,17 +632,15 @@ _check_one_postgres() {
     fi
 
     for db in ${dbs}; do
-        n=$(_dexec "${cid}" psql -w -U "${user}" -d "${db}" -tAc \
-            "select count(*) from information_schema.tables
-             where table_schema not in ('pg_catalog','information_schema')" \
+        n=$(_pgq "${cid}" "${db}" \
+            "select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema')" \
             | tr -d '\r ')
-        [ -n "${n}" ] || n=0
+        case "${n}" in ''|*[!0-9]*) n=0 ;; esac
 
         # Размер вместо подсчёта строк: пересчитывать строки во всех таблицах
         # долго и незачем, а размер сразу показывает, лежат ли за схемой данные.
-        size=$(_dexec "${cid}" psql -w -U "${user}" -tAc \
-            "select pg_database_size('${db}')" | tr -d '\r ')
-        [ -n "${size}" ] || size=0
+        size=$(_pgq "${cid}" postgres "select pg_database_size('${db}')" | tr -d '\r ')
+        case "${size}" in ''|*[!0-9]*) size=0 ;; esac
 
         if [ "${n}" -eq 0 ]; then
             check_fail "${cname}/${db}: таблиц нет - восстановление не состоялось"
@@ -617,18 +669,44 @@ check_clickhouse() {
     [ "${found}" = "1" ] || check_warn "контейнеры ${PROJECT}_clickhouse* не найдены на этом хосте"
 }
 
-_check_one_clickhouse() {
-    local cid="$1" cname="$2" n rows
+# Запрос к ClickHouse. Пароль, если он задан, уходит через стандартный ввод -
+# в argv команды docker на хосте он не появляется.
+_chq() {
+    local cid="$1" q="$2"
+    if [ -n "${CH_PASS}" ]; then
+        printf '%s' "${CH_PASS}" | sudo timeout 30 docker exec -i "${cid}" \
+            sh -c 'export CLICKHOUSE_PASSWORD=$(cat); exec clickhouse-client --user "$1" --query "$2"' \
+            sh "${CH_USER}" "${q}" 2>&1
+    else
+        sudo timeout 30 docker exec "${cid}" clickhouse-client --query "${q}" 2>&1
+    fi
+}
 
-    if ! _dexec "${cid}" clickhouse-client --query 'SELECT 1' >/dev/null; then
-        check_fail "${cname}: не отвечает на запрос"
+_ch_connect() {
+    local cid="$1" u p
+    CH_USER="default"; CH_PASS=""
+    _chq "${cid}" 'SELECT 1' | grep -q '^1$' && return 0
+
+    u=$(_find_env_value "${cid}" CLICKHOUSE_USER CH_USER) || u=""
+    p=$(_find_env_value "${cid}" CLICKHOUSE_PASSWORD CH_PASSWORD) || p=""
+    CH_USER="${u:-default}"; CH_PASS="${p}"
+    [ -n "${CH_PASS}" ] || return 1
+    _chq "${cid}" 'SELECT 1' | grep -q '^1$' && return 0
+    return 1
+}
+
+_check_one_clickhouse() {
+    local cid="$1" cname="$2" n rows out
+
+    if ! _ch_connect "${cid}"; then
+        out=$(_chq "${cid}" 'SELECT 1' | head -2 | tr '\n' ' ')
+        check_fail "${cname}: подключиться не удалось. Ответ: ${out:-пусто}"
         return
     fi
     check_ok "${cname}: отвечает"
 
-    n=$(_dexec "${cid}" clickhouse-client --query \
-        "SELECT count() FROM system.tables WHERE database = '${CH_DB}'" | tr -d '\r ')
-    [ -n "${n}" ] || n=0
+    n=$(_chq "${cid}" "SELECT count() FROM system.tables WHERE database = '${CH_DB}'" | tr -d '\r ')
+    case "${n}" in ''|*[!0-9]*) n=0 ;; esac
     if [ "${n}" -eq 0 ]; then
         check_fail "${cname}: в базе ${CH_DB} нет таблиц - данные не восстановлены"
     else
@@ -639,10 +717,9 @@ _check_one_clickhouse() {
     # Строки берутся из system.parts, а не count() по таблицам: это одна быстрая
     # выборка из метаданных вместо обхода данных. Таблицы могут существовать
     # пустыми - схема восстановилась, а данные нет.
-    rows=$(_dexec "${cid}" clickhouse-client --query \
-        "SELECT sum(rows) FROM system.parts WHERE database = '${CH_DB}' AND active" \
-        | tr -d '\r ')
-    [ -n "${rows}" ] || rows=0
+    rows=$(_chq "${cid}" \
+        "SELECT sum(rows) FROM system.parts WHERE database = '${CH_DB}' AND active" | tr -d '\r ')
+    case "${rows}" in ''|*[!0-9]*) rows=0 ;; esac
     if [ "${rows}" -eq 0 ]; then
         check_fail "${cname}: таблицы есть, но строк нет - данные не восстановлены"
     else
@@ -678,38 +755,55 @@ check_http() {
         return
     fi
 
-    local base="${HTTP_URL}"
-    [ -n "${base}" ] || base="https://127.0.0.1"
-    base="${base%/}"
+    # Без явного адреса пробуем оба протокола: на локальном адресе платформа
+    # может отвечать по http, а сертификат быть выписан только на внешнее имя.
+    local bases=()
+    if [ -n "${HTTP_URL}" ]; then
+        bases=("${HTTP_URL%/}")
+    else
+        bases=("https://127.0.0.1" "http://127.0.0.1")
+    fi
 
-    # Корень. Здесь годится широкий диапазон: платформа отвечает как 200, так и
-    # перенаправлением на вход в Keycloak. Значение имеет только то, что ответ
-    # вообще пришёл и это не отказ шлюза.
-    local code
-    code=$(_http_code "${base}/")
+    local base="" code="" b err
+    for b in "${bases[@]}"; do
+        code=$(_http_code "${b}/")
+        [ "${code}" != "000" ] && { base="${b}"; break; }
+    done
+
+    if [ -z "${base}" ]; then
+        # Причину печатает сам curl - без неё непонятно, отказ ли это в
+        # соединении, неверное имя или истёкшее время ожидания.
+        err=$(curl -sS -k -o /dev/null -m "${HTTP_TIMEOUT}" "${bases[0]}/" 2>&1 | head -1)
+        check_fail "${bases[0]}/ - нет ответа: ${err:-причина не сообщена}"
+        check_warn "Keycloak не проверялся: платформа не отвечает по HTTP"
+        return
+    fi
+
+    # Годится широкий диапазон: платформа отвечает и 200, и перенаправлением на
+    # вход. Значение имеет лишь то, что ответ пришёл и это не отказ шлюза.
     case "${code}" in
-        000) check_fail "${base}/ - соединение не установлено" ;;
-        5*)  check_fail "${base}/ - код ${code}, обратный прокси жив, а служба за ним нет" ;;
-        *)   check_ok   "${base}/ - код ${code}" ;;
+        5*) check_fail "${base}/ - код ${code}, обратный прокси жив, а служба за ним нет" ;;
+        *)  check_ok   "${base}/ - код ${code}" ;;
     esac
 
     # Keycloak. Ответ на этот адрес означает, что жив и сам Keycloak, и его база:
     # конфигурацию realm он читает из Postgres. Первый путь - фактический для
     # нашей сборки, он же используется в рабочем примере получения токена.
-    # Остальные оставлены на случай другой раскладки обратного прокси.
     local realm="${KEYCLOAK_REALM:-Visiology}"
-    local u body found=0
+    local u body found=0 last=""
     for u in "${base}${KEYCLOAK_PREFIX}/realms/${realm}/.well-known/openid-configuration" \
              "${base}/auth/realms/${realm}/.well-known/openid-configuration" \
              "${base}/realms/${realm}/.well-known/openid-configuration"; do
         body=$(curl -sS -k -m "${HTTP_TIMEOUT}" "${u}" 2>/dev/null) || body=""
+        last=$(_http_code "${u}")
         if printf '%s' "${body}" | grep -q '"issuer"'; then
-            check_ok "Keycloak отвечает и отдаёт конфигурацию realm ${realm}"
+            check_ok "Keycloak отдаёт конфигурацию realm ${realm}"
             found=1
             break
         fi
     done
-    [ "${found}" = "1" ] || check_fail "Keycloak не отдал конфигурацию realm ${realm} - проверьте его и его базу"
+    [ "${found}" = "1" ] \
+        || check_fail "Keycloak не отдал конфигурацию realm ${realm} (последний код ${last}) - проверьте его и его базу"
 }
 
 ########################################
