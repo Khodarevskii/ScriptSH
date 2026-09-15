@@ -46,7 +46,8 @@ HTTP_TIMEOUT=15
 # Восстановление распаковывает рядом каталог примерно того же объёма.
 SPACE_FACTOR_X10=25
 
-# Keycloak за обратным прокси лежит не по стандартному /auth и не по /realms.
+# Запасной путь к Keycloak, если платформа не сообщила свой. Обычно он не
+# нужен: фактический адрес читается из переменных окружения служб.
 KEYCLOAK_PREFIX="/v3/keycloak"
 # Клиент и набор прав для проверки входа - как в рабочем примере получения
 # токена. Прямой вход по логину и паролю у этого клиента разрешён, браузер не
@@ -223,6 +224,22 @@ fi
 # Имя контейнера службы в Swarm: <служба>.<слот>.<идентификатор>. Точка после
 # имени службы обязательна в шаблоне, иначе фильтр по "..._postgres" поймает и
 # "..._postgres-visiology", и проверяться будет не та база.
+# Переменные окружения всех служб платформы одним вызовом. Перебор служб по
+# одной занимал бы секунды: их два с половиной десятка.
+_platform_env() {
+    local ids
+    ids=$(sudo docker service ls -q --filter "name=${PROJECT}_" 2>/dev/null | tr '\n' ' ')
+    [ -n "${ids}" ] || return 1
+    # shellcheck disable=SC2086
+    sudo timeout 30 docker service inspect ${ids} \
+        --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' 2>/dev/null
+}
+
+# Значение переменной из окружения служб платформы.
+_platform_env_value() {
+    printf '%s\n' "${PLATFORM_ENV}" | sed -n "s/^$1=//p" | head -1 | tr -d '\r'
+}
+
 resolve_container() {
     sudo docker ps --filter "name=^$1\\." --format '{{.ID}}' 2>/dev/null | head -1
 }
@@ -280,6 +297,19 @@ _free_bytes() {
 _human() {
     numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 байт"
 }
+
+########################################
+# Адреса платформы
+########################################
+# Платформа сама знает, под каким именем к ней обращаются: оно передано её
+# службам переменными окружения при развёртывании. Это надёжнее любых догадок -
+# в nginx имени нет (там default_server), в config.env тоже.
+#
+# KEYCLOAK_EXTERNAL_REALM_PATH ценнее прочего: это готовый путь к realm целиком,
+# поэтому ни префикс, ни имя realm угадывать не приходится.
+PLATFORM_ENV=$(_platform_env) || PLATFORM_ENV=""
+PLATFORM_URL_ENV=$(_platform_env_value PLATFORM_URL)
+REALM_PATH=$(_platform_env_value KEYCLOAK_EXTERNAL_REALM_PATH)
 
 ########################################
 # Поиск архива
@@ -787,15 +817,17 @@ check_http() {
         return
     fi
 
-    # Обращаться к 127.0.0.1 правильно: nginx платформы объявлен как
-    # default_server и отвечает на запрос с любым именем в заголовке, поэтому
-    # виртуальных хостов, под которые нужно подстраиваться, здесь нет.
-    # Проверять нужно именно эту машину, а не то, куда указывает внешний DNS.
+    # Порядок источников: явный ключ, затем адрес, который платформа сообщает
+    # своим службам, и лишь затем 127.0.0.1 вслепую.
     local bases=()
     if [ -n "${HTTP_URL}" ]; then
         bases=("${HTTP_URL%/}")
+    elif [ -n "${PLATFORM_URL_ENV}" ]; then
+        bases=("${PLATFORM_URL_ENV%/}")
+        log "  адрес платформы из её настроек: ${PLATFORM_URL_ENV}"
     else
         bases=("https://127.0.0.1" "http://127.0.0.1")
+        log "  адрес платформы не найден, пробую 127.0.0.1"
     fi
 
     local base="" code="" b err
@@ -820,14 +852,17 @@ check_http() {
         *)  check_ok   "${base}/ - код ${code}" ;;
     esac
 
-    # Keycloak. Ответ на этот адрес означает, что жив и сам Keycloak, и его база:
-    # конфигурацию realm он читает из Postgres. Первый путь - фактический для
-    # нашей сборки, он же используется в рабочем примере получения токена.
+    # Keycloak. Ответ означает, что жив и он сам, и его база: конфигурацию
+    # realm он читает из Postgres. Путь берём тот, который платформа раздаёт
+    # своим службам; остальные варианты - на случай, если его нет.
     local realm="${KEYCLOAK_REALM:-Visiology}"
     local u body found=0 last=""
-    for u in "${base}${KEYCLOAK_PREFIX}/realms/${realm}/.well-known/openid-configuration" \
-             "${base}/auth/realms/${realm}/.well-known/openid-configuration" \
-             "${base}/realms/${realm}/.well-known/openid-configuration"; do
+    local urls=()
+    [ -n "${REALM_PATH}" ] && urls+=("${REALM_PATH%/}/.well-known/openid-configuration")
+    urls+=("${base}${KEYCLOAK_PREFIX}/realms/${realm}/.well-known/openid-configuration" \
+           "${base}/realms/${realm}/.well-known/openid-configuration")
+
+    for u in "${urls[@]}"; do
         body=$(curl -sS -k -m "${HTTP_TIMEOUT}" "${u}" 2>/dev/null) || body=""
         last=$(_http_code "${u}")
         if printf '%s' "${body}" | grep -q '"issuer"'; then
@@ -861,11 +896,15 @@ check_login() {
         return
     fi
 
-    local base="${HTTP_URL}"
-    [ -n "${base}" ] || base="https://127.0.0.1"
+    local base="${HTTP_URL:-${PLATFORM_URL_ENV:-https://127.0.0.1}}"
     base="${base%/}"
     local realm="${KEYCLOAK_REALM:-Visiology}"
-    local kc="${base}${KEYCLOAK_PREFIX}/realms/${realm}/protocol/openid-connect"
+    local kc
+    if [ -n "${REALM_PATH}" ]; then
+        kc="${REALM_PATH%/}/protocol/openid-connect"
+    else
+        kc="${base}${KEYCLOAK_PREFIX}/realms/${realm}/protocol/openid-connect"
+    fi
 
     # Пароль уходит в curl через файл, а не аргументом: аргументы процесса
     # видны в ps. По той же причине токен передаётся файлом настроек curl, а не
