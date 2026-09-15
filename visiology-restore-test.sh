@@ -85,6 +85,9 @@ LOGIN_USER=""
 LOGIN_PASSWORD=""
 PASSWORD_FILE=""
 
+# Оставить распакованный каталог после прогона. Нужен разве что для разбора.
+KEEP_BACKUP_DIR=0
+
 ARCHIVE=""
 DO_RESTORE=1
 DO_TESTS=1
@@ -139,6 +142,7 @@ print_help() {
                       для явности)
       --keep-running СПИСОК  что не гасить, через запятую; по умолчанию базы,
                       backup-service и службы наблюдения
+      --keep-backup-dir   не чистить распакованный каталог после прогона
       --ignore СПИСОК не проверять эти службы, через запятую и без префикса
                       проекта: --ignore prometheus,grafana
       --login-user ИМЯ    проверить, что этот пользователь может войти
@@ -175,6 +179,7 @@ while [ "$1" != "" ]; do
         --stop-services) STOP_SERVICES=1 ;;
         --no-stop-services) STOP_SERVICES=0 ;;
         --keep-running) shift; KEEP_RUNNING=$(printf '%s' "$1" | tr ',' ' ') ;;
+        --keep-backup-dir) KEEP_BACKUP_DIR=1 ;;
         --ignore)      shift; IGNORE_SERVICES="$1" ;;
         --login-user)  shift; LOGIN_USER="$1" ;;
         --password-file) shift; PASSWORD_FILE="$1" ;;
@@ -599,6 +604,27 @@ wait_services() {
         log "  ещё поднимаются: ${pending}, осталось ждать ${left} с"
         sleep 30
     done
+}
+
+########################################
+# Очистка рабочего каталога
+########################################
+# restore.sh распаковывает архив в BACKUP_DIR/backup и оставляет его там -
+# столько же гигабайт, сколько весит сам архив. Платформе этот каталог не
+# нужен: при следующем восстановлении он распаковывается заново, а до тех пор
+# лишь занимает место.
+#
+# Команда намеренно повторяет ту, что стоит в самом restore.sh. Добавлено
+# только ${...:?} - оно прерывает выполнение, если переменная окажется пустой,
+# чтобы удаление ни при каких обстоятельствах не ушло в корень файловой системы.
+cleanup_backup_dir() {
+    local dir="${BACKUP_DIR%/}/backup" freed
+    [ -d "${dir}" ] || return 0
+    [ -n "$(sudo ls -A "${dir}" 2>/dev/null)" ] || return 0
+
+    freed=$(sudo du -sh "${dir}" 2>/dev/null | cut -f1) || freed=""
+    sudo rm -rf "${dir:?}"/*
+    log "каталог ${dir} очищен${freed:+, освобождено ${freed}}"
 }
 
 ########################################
@@ -1234,6 +1260,16 @@ if [ "${DO_TESTS}" = "1" ]; then
     compare_state
 else
     log "проверки пропущены (--restore-only)"
+fi
+
+# Уборка после всего: если восстановление сорвалось, содержимое каталога может
+# понадобиться для разбора, поэтому чистим только успешный прогон.
+if [ "${DO_RESTORE}" = "1" ] && [ "${KEEP_BACKUP_DIR}" != "1" ]; then
+    if [ "${RESTORE_RC}" -eq 0 ] && [ -z "${RESTORE_BAD_HTTP}" ]; then
+        cleanup_backup_dir
+    else
+        log "каталог ${BACKUP_DIR%/}/backup оставлен для разбора: восстановление завершилось с ошибкой"
+    fi
 fi
 
 ########################################
