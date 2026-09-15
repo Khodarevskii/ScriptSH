@@ -85,6 +85,12 @@ LOGIN_USER=""
 LOGIN_PASSWORD=""
 PASSWORD_FILE=""
 
+# Выполнять ли после восстановления цикл, которого требует сам restore.sh:
+# остановка платформы, перегенерация конфигураций, запуск. Без него платформа
+# работает на прежних настройках, а восстановленные файлы лежат неприменёнными -
+# сколько ни жди, штатной работы не будет.
+APPLY_CONFIGS=1
+
 # Оставить распакованный каталог после прогона. Нужен разве что для разбора.
 KEEP_BACKUP_DIR=0
 
@@ -142,6 +148,10 @@ print_help() {
                       для явности)
       --keep-running СПИСОК  что не гасить, через запятую; по умолчанию базы,
                       backup-service и службы наблюдения
+      --no-apply-configs  не выполнять после восстановления остановку
+                      платформы, перегенерацию конфигураций и запуск. По
+                      умолчанию они выполняются - этого требует сам restore.sh,
+                      и без них платформа остаётся на прежних настройках
       --keep-backup-dir   не чистить распакованный каталог после прогона
       --ignore СПИСОК не проверять эти службы, через запятую и без префикса
                       проекта: --ignore prometheus,grafana
@@ -179,6 +189,7 @@ while [ "$1" != "" ]; do
         --stop-services) STOP_SERVICES=1 ;;
         --no-stop-services) STOP_SERVICES=0 ;;
         --keep-running) shift; KEEP_RUNNING=$(printf '%s' "$1" | tr ',' ' ') ;;
+        --no-apply-configs) APPLY_CONFIGS=0 ;;
         --keep-backup-dir) KEEP_BACKUP_DIR=1 ;;
         --ignore)      shift; IGNORE_SERVICES="$1" ;;
         --login-user)  shift; LOGIN_USER="$1" ;;
@@ -480,6 +491,9 @@ confirm() {
         echo "  службы:   ОСТАНУТСЯ РАБОТАТЬ - как штатный restore.sh."
         echo "            Платформа будет писать в базы во время восстановления"
     fi
+    if [ "${APPLY_CONFIGS}" = "1" ]; then
+        echo "  после:    остановка платформы, перегенерация конфигураций, запуск"
+    fi
     if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
         echo "  доп.ключи restore.sh: ${EXTRA_ARGS[*]}"
     fi
@@ -604,6 +618,59 @@ wait_services() {
         log "  ещё поднимаются: ${pending}, осталось ждать ${left} с"
         sleep 30
     done
+}
+
+########################################
+# Применение восстановленных конфигураций
+########################################
+# restore.sh заменяет env-files, extended-services и custom-configs на диске, но
+# сам их не применяет - он лишь печатает три команды и заканчивает работу. Пока
+# они не выполнены, платформа работает на прежних настройках, а восстановленные
+# файлы лежат мёртвым грузом.
+#
+# Поэтому цикл выполняется здесь: остановка, перегенерация, запуск. И только
+# после него имеет смысл что-либо проверять.
+_run_step() {
+    local title="$1"; shift
+    local rc t0 t1
+    log "  ${title}..."
+    t0=$(date +%s)
+    "$@" >> "${RESTORE_LOG}" 2>&1
+    rc=$?
+    t1=$(date +%s)
+    if [ "${rc}" -eq 0 ]; then
+        log "    готово за $(( t1 - t0 )) с"
+    else
+        warn "${title}: код ${rc}, подробности в ${RESTORE_LOG}"
+    fi
+    return "${rc}"
+}
+
+apply_configs() {
+    # run.sh лежит уровнем выше: скрипты платформы разложены как
+    # scripts/run.sh и scripts/v3/prepare-config.sh.
+    local run_sh prep
+    run_sh="$(dirname -- "${SCRIPT_DIR}")/run.sh"
+    prep="${SCRIPT_DIR}/prepare-config.sh"
+
+    if [ ! -f "${run_sh}" ] || [ ! -f "${prep}" ]; then
+        warn "не найдены ${run_sh} или ${prep} - выполните вручную:"
+        warn "  ${run_sh} --stop"
+        warn "  ${prep} --force-regenerate-configs"
+        warn "  ${run_sh} --restart"
+        return 1
+    fi
+
+    log "применяю восстановленные конфигурации"
+    APPLIED_CONFIGS=1
+
+    # Остановка и перегенерация могут не получиться, но запуск выполняется в
+    # любом случае: оставить контур лежащим - худший из исходов.
+    _run_step "остановка платформы" sudo timeout 1800 "${run_sh}" --stop || true
+    _run_step "перегенерация конфигураций" sudo timeout 1800 "${prep}" --force-regenerate-configs \
+        || warn "конфигурации не перегенерированы - платформа поднимется на прежних настройках"
+    _run_step "запуск платформы" sudo timeout 1800 "${run_sh}" --restart \
+        || warn "платформа не запустилась. Запустите вручную: ${run_sh} --restart"
 }
 
 ########################################
@@ -1206,6 +1273,7 @@ RESTORE_LOG=""
 RESTORE_RC=0
 RESTORE_BAD_HTTP=""
 RESTORE_MARKERS=""
+APPLIED_CONFIGS=0
 
 log "=== начало ==="
 log "сервер: $(hostname), проект: ${PROJECT}, версия: ${VERSION:-неизвестна}"
@@ -1237,9 +1305,18 @@ if [ "${DO_RESTORE}" = "1" ]; then
 
     run_restore
 
+    # Реплики возвращаются до штатного цикла: что именно делает run.sh, мы не
+    # знаем, и отдавать ему платформу с погашенными службами неправильно.
     if [ "${STOP_SERVICES}" = "1" ]; then
         start_services
         trap - EXIT INT TERM
+    fi
+
+    if [ "${APPLY_CONFIGS}" = "1" ]; then
+        apply_configs
+    else
+        log "цикл применения конфигураций пропущен (--no-apply-configs)"
+        log "  платформа осталась на прежних настройках"
     fi
 
     wait_services || true
@@ -1283,6 +1360,7 @@ if [ "${DO_RESTORE}" = "1" ]; then
     log "восстановление: код ${RESTORE_RC}, журнал ${RESTORE_LOG}"
     [ -n "${RESTORE_BAD_HTTP}" ] && log "  backup-service отвечал кодами: ${RESTORE_BAD_HTTP}"
     [ -n "${RESTORE_MARKERS}" ]  && log "  в выводе были признаки ошибок, см. журнал"
+    [ "${APPLIED_CONFIGS}" = "1" ] && log "  конфигурации применены, платформа перезапущена"
 fi
 
 if [ "${DO_TESTS}" = "1" ]; then
