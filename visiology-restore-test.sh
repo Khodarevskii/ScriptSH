@@ -77,6 +77,12 @@ KEEP_RUNNING="postgres clickhouse smart-forms-db etl-db minio backup-service jdb
 # Здесь запоминается, сколько реплик было у каждой погашенной службы.
 SERVICES_STATE_FILE="/var/tmp/visiology-restore-test.services"
 
+# Службы, по которым судят о готовности платформы. Ждать все подряд
+# бессмысленно: одна вечно лежащая второстепенная служба задержала бы прогон на
+# весь отведённый срок, ничего при этом не значая. Если поднялись эти - система
+# встала. Остальные всё равно попадут в отчёт проверками, просто их не ждут.
+ESSENTIAL_SERVICES="postgres clickhouse keycloak edge backup-service dashboard-service dashboard-viewer visiology-designer workspace-service formula-engine data-management-service smart-forms"
+
 # Службы, которые не проверяются: отключены осознанно и их состояние ни о чём
 # не говорит. Список через запятую, имена без префикса проекта.
 IGNORE_SERVICES=""
@@ -153,6 +159,8 @@ print_help() {
                       умолчанию они выполняются - этого требует сам restore.sh,
                       и без них платформа остаётся на прежних настройках
       --keep-backup-dir   не чистить распакованный каталог после прогона
+      --essential СПИСОК  по каким службам судить о готовности платформы,
+                      через запятую. Остальных не ждут, но проверяют
       --ignore СПИСОК не проверять эти службы, через запятую и без префикса
                       проекта: --ignore prometheus,grafana
       --login-user ИМЯ    проверить, что этот пользователь может войти
@@ -191,6 +199,7 @@ while [ "$1" != "" ]; do
         --keep-running) shift; KEEP_RUNNING=$(printf '%s' "$1" | tr ',' ' ') ;;
         --no-apply-configs) APPLY_CONFIGS=0 ;;
         --keep-backup-dir) KEEP_BACKUP_DIR=1 ;;
+        --essential)   shift; ESSENTIAL_SERVICES=$(printf '%s' "$1" | tr ',' ' ') ;;
         --ignore)      shift; IGNORE_SERVICES="$1" ;;
         --login-user)  shift; LOGIN_USER="$1" ;;
         --password-file) shift; PASSWORD_FILE="$1" ;;
@@ -585,11 +594,26 @@ _services_raw() {
         | grep "^${PROJECT}_" || true
 }
 
-# Сколько служб не набрали нужное число реплик.
+# Ключевая ли это служба.
+_is_essential() {
+    local name="$1" pat
+    for pat in ${ESSENTIAL_SERVICES}; do
+        case "${name}" in *"${pat}"*) return 0 ;; esac
+    done
+    return 1
+}
+
+# Сколько ключевых служб ещё не набрали реплики.
+#
+# Считаются только они. Второстепенная служба, которая не поднимается по своим
+# причинам, не должна задерживать прогон: в отчёт она всё равно попадёт, а
+# ждать её - значит стоять до конца отведённого срока впустую.
 _services_pending() {
     local name reps run want pending=0
     while IFS='|' read -r name reps; do
         [ -n "${name}" ] || continue
+        _is_essential "${name}" || continue
+        _is_ignored "${name}" && continue
         reps=$(_reps_clean "${reps}")
         run="${reps%%/*}"
         want="${reps##*/}"
@@ -598,24 +622,38 @@ _services_pending() {
     printf '%s' "${pending}"
 }
 
+# Имена ключевых служб, которые ещё не готовы - для сообщения.
+_services_pending_names() {
+    local name reps run want
+    while IFS='|' read -r name reps; do
+        [ -n "${name}" ] || continue
+        _is_essential "${name}" || continue
+        _is_ignored "${name}" && continue
+        reps=$(_reps_clean "${reps}")
+        run="${reps%%/*}"
+        want="${reps##*/}"
+        [ "${run}" = "${want}" ] || printf '%s ' "${name#${PROJECT}_}"
+    done < <(_services_raw)
+}
+
 wait_services() {
     local deadline pending left
     deadline=$(( $(date +%s) + WAIT_SERVICES ))
 
-    log "жду подъёма служб (до ${WAIT_SERVICES} с)"
+    log "жду подъёма ключевых служб (до ${WAIT_SERVICES} с)"
     while :; do
         pending=$(_services_pending)
         [ -n "${pending}" ] || pending=0
         if [ "${pending}" -eq 0 ]; then
-            log "  все службы набрали реплики"
+            log "  ключевые службы поднялись"
             return 0
         fi
         left=$(( deadline - $(date +%s) ))
         if [ "${left}" -le 0 ]; then
-            warn "по истечении ${WAIT_SERVICES} с не поднялись службы: ${pending}"
+            warn "по истечении ${WAIT_SERVICES} с не поднялись ключевые службы: $(_services_pending_names)"
             return 1
         fi
-        log "  ещё поднимаются: ${pending}, осталось ждать ${left} с"
+        log "  ещё поднимаются: $(_services_pending_names)(осталось ${left} с)"
         sleep 30
     done
 }
