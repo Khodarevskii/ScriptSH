@@ -724,6 +724,11 @@ _check_one_postgres() {
     fi
 
     for db in ${dbs}; do
+        # Postgres при инициализации заводит базу с именем пользователя, если
+        # не указано иное. Она всегда пуста, платформа её не использует, и
+        # отсутствие таблиц в ней - норма, а не признак поломки.
+        [ "${db}" = "${PG_USER}" ] && continue
+
         n=$(_pgq "${cid}" "${db}" \
             "select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema')" \
             | tr -d '\r ')
