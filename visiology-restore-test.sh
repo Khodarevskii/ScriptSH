@@ -54,6 +54,10 @@ KEYCLOAK_PREFIX="/v3/keycloak"
 LOGIN_CLIENT="visiology_designer"
 LOGIN_SCOPE="openid data_management_service formula_engine workspace_service dashboard_service forms_service groups"
 
+# Службы, которые не проверяются: отключены осознанно и их состояние ни о чём
+# не говорит. Список через запятую, имена без префикса проекта.
+IGNORE_SERVICES=""
+
 LOGIN_USER=""
 LOGIN_PASSWORD=""
 PASSWORD_FILE=""
@@ -108,6 +112,8 @@ print_help() {
                       соединение всё равно идёт на 127.0.0.1
       --wait СЕК      сколько ждать подъёма служб после восстановления
                       по умолчанию 900
+      --ignore СПИСОК не проверять эти службы, через запятую и без префикса
+                      проекта: --ignore prometheus,grafana
       --login-user ИМЯ    проверить, что этот пользователь может войти
       --password-file ПУТЬ  файл с его паролем, первая строка
 
@@ -139,6 +145,7 @@ while [ "$1" != "" ]; do
         --any-version) ANY_VERSION=1 ;;
         --url)         shift; HTTP_URL="$1" ;;
         --wait)        shift; WAIT_SERVICES="$1" ;;
+        --ignore)      shift; IGNORE_SERVICES="$1" ;;
         --login-user)  shift; LOGIN_USER="$1" ;;
         --password-file) shift; PASSWORD_FILE="$1" ;;
         --)            shift; EXTRA_ARGS=("$@"); break ;;
@@ -498,6 +505,26 @@ wait_services() {
 ########################################
 # Проверка 1. Службы Swarm
 ########################################
+# Почему служба не набрала реплики. Swarm хранит это в состоянии последней
+# задачи: без причины отказ "0/1" ничего не объясняет и тонет среди прочих.
+_service_reason() {
+    sudo timeout 20 docker service ps "$1" --no-trunc \
+        --format '{{.CurrentState}} {{.Error}}' 2>/dev/null \
+        | head -1 | sed 's/[[:space:]]\{2,\}/ /g' | cut -c1-160
+}
+
+_is_ignored() {
+    local short="${1#${PROJECT}_}" item
+    local IFS=','
+    for item in ${IGNORE_SERVICES}; do
+        item="${item## }"; item="${item%% }"
+        [ -n "${item}" ] || continue
+        [ "${item}" = "${short}" ] && return 0
+        [ "${item}" = "$1" ] && return 0
+    done
+    return 1
+}
+
 check_services() {
     log "службы Swarm"
     local name reps run want total=0
@@ -507,12 +534,17 @@ check_services() {
         reps=$(_reps_clean "${reps}")
         run="${reps%%/*}"
         want="${reps##*/}"
-        if [ "${run}" = "${want}" ] && [ "${run}" != "0" ]; then
+        if _is_ignored "${name}"; then
+            check_warn "${name} ${reps} - не проверяется по --ignore"
+        elif [ "${run}" = "${want}" ] && [ "${run}" != "0" ]; then
             check_ok "${name} ${reps}"
         elif [ "${want}" = "0" ]; then
-            check_warn "${name} ${reps} - служба выключена намеренно"
+            check_warn "${name} ${reps} - выключена: Swarm не запрашивает ни одной реплики"
         else
-            check_fail "${name} ${reps} - реплики не набраны"
+            # Разница между "выключена" и "не запускается" принципиальна: в
+            # первом случае так задумано, во втором служба должна работать и не
+            # может. Swarm их и различает - 0/0 против 0/N.
+            check_fail "${name}: не запущена (${run} из ${want}). $(_service_reason "${name}")"
         fi
     done < <(_services_raw)
 
@@ -751,24 +783,67 @@ _http_code() {
     esac
 }
 
-# Доменное имя платформы из конфигурации её собственного nginx.
-#
-# Обращаться к 127.0.0.1 бесполезно: nginx раздаёт по виртуальному хосту и на
-# запрос без правильного имени отвечает не тем или не отвечает вовсе. Имя берём
-# из действующей конфигурации - "nginx -T" печатает её целиком, вместе со всеми
-# подключаемыми файлами, поэтому искать по каталогам не нужно.
-_nginx_server_name() {
-    local svc cid=""
-    for svc in edge reverse-proxy nginx proxy; do
-        cid=$(resolve_container "${PROJECT}_${svc}")
-        [ -n "${cid}" ] && break
-    done
-    [ -n "${cid}" ] || return 1
-
-    sudo timeout 20 docker exec "${cid}" nginx -T 2>/dev/null \
-        | sed -n 's/^[[:space:]]*server_name[[:space:]]\{1,\}\([^;]*\);.*/\1/p' \
+# Выбор доменного имени из текста конфигурации nginx.
+_pick_server_name() {
+    sed -n 's/^[[:space:]]*server_name[[:space:]]\{1,\}\([^;]*\);.*/\1/p' \
         | tr ' ' '\n' | tr -d '\r' \
         | grep -vE '^(_|localhost|\*|)$' | head -1
+}
+
+# Имя площадки из конфигурации платформы. Файлы nginx у Visiology не пишутся
+# руками, а порождаются prepare-config.sh из config.env - значит адрес есть и
+# там, причём в виде, не зависящем от того, как устроен контейнер прокси.
+# Ключ не угадываем: берём первое значение, похожее на доменное имя, отбрасывая
+# адреса реестров образов и почтовые.
+_domain_from_config() {
+    local f
+    for f in "${SCRIPT_DIR}/config.env" "${SCRIPT_DIR}/defaults.env"; do
+        [ -f "${f}" ] || continue
+        sed -n 's/^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=//p' "${f}" 2>/dev/null \
+            | tr -d '"'"'"'\r' \
+            | sed 's|^https\?://||; s|/.*$||' \
+            | grep -oE '^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$' \
+            | grep -vE '^(cr\.|.*\.docker\.|.*registry.*)' \
+            | grep -vE '@' \
+            | head -1
+    done | head -1
+}
+
+# Доменное имя площадки. Обращаться к 127.0.0.1 бесполезно: nginx раздаёт по
+# виртуальному хосту и на запрос без правильного имени отвечает не тем или не
+# отвечает вовсе.
+#
+# Источники по убыванию достоверности: действующая конфигурация nginx внутри
+# контейнера прокси, затем его файлы конфигурации напрямую (nginx -T есть не в
+# каждой сборке), затем конфигурация платформы.
+_nginx_server_name() {
+    local svc cid name cids=""
+
+    # Сначала вероятные имена, затем все остальные контейнеры платформы: имя
+    # службы прокси в разных сборках отличается.
+    for svc in edge reverse-proxy nginx proxy gateway; do
+        cid=$(resolve_container "${PROJECT}_${svc}")
+        [ -n "${cid}" ] && cids="${cids} ${cid}"
+    done
+    cids="${cids} $(sudo docker ps --filter "name=^${PROJECT}_" --format '{{.ID}}' 2>/dev/null | tr '\n' ' ')"
+
+    local seen=" "
+    for cid in ${cids}; do
+        case "${seen}" in *" ${cid} "*) continue ;; esac
+        seen="${seen}${cid} "
+
+        name=$(sudo timeout 15 docker exec "${cid}" nginx -T 2>/dev/null | _pick_server_name)
+        [ -n "${name}" ] && { printf '%s' "${name}"; return 0; }
+
+        name=$(sudo timeout 15 docker exec "${cid}" sh -c \
+                'cat /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* 2>/dev/null' \
+                2>/dev/null | _pick_server_name)
+        [ -n "${name}" ] && { printf '%s' "${name}"; return 0; }
+    done
+
+    name=$(_domain_from_config)
+    [ -n "${name}" ] && { printf '%s' "${name}"; return 0; }
+    return 1
 }
 
 check_http() {
@@ -790,10 +865,10 @@ check_http() {
             # а не то, куда указывает внешний DNS.
             CURL_EXTRA=(--resolve "${dom}:443:127.0.0.1" --resolve "${dom}:80:127.0.0.1")
             bases=("https://${dom}" "http://${dom}")
-            log "  адрес из конфигурации nginx: ${dom} (соединение на 127.0.0.1)"
+            log "  имя площадки: ${dom} (соединение на 127.0.0.1)"
         else
             bases=("https://127.0.0.1" "http://127.0.0.1")
-            log "  имя площадки в nginx не найдено, пробую 127.0.0.1"
+            log "  имя площадки не найдено ни в nginx, ни в config.env - пробую 127.0.0.1"
         fi
     fi
 
