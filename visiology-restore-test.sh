@@ -256,18 +256,40 @@ _containers_like() {
     done
 }
 
-# Значение первой найденной переменной из списка. Сначала смотрим окружение
-# самого контейнера, затем env-files платформы - тот самый каталог, который
-# backup.sh складывает в архив, там и живут учётные данные баз.
+# Значение переменной из окружения контейнера.
+#
+# Образы баз принимают учётные данные двумя способами: прямо в переменной либо
+# через переменную с суффиксом _FILE, где лежит путь к файлу с секретом -
+# именно так их и подкладывает Swarm. Поэтому обычных POSTGRES_USER и
+# POSTGRES_PASSWORD в окружении может не быть вовсе, а быть POSTGRES_USER_FILE.
+_container_value() {
+    local cid="$1"; shift
+    local k v path env_dump
+    env_dump=$(sudo timeout 10 docker inspect \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' "${cid}" 2>/dev/null)
+
+    for k in "$@"; do
+        v=$(printf '%s\n' "${env_dump}" | sed -n "s/^${k}=//p" | head -1 | tr -d '\r')
+        [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+
+        path=$(printf '%s\n' "${env_dump}" | sed -n "s/^${k}_FILE=//p" | head -1 | tr -d '\r')
+        if [ -n "${path}" ]; then
+            v=$(sudo timeout 10 docker exec "${cid}" cat -- "${path}" 2>/dev/null \
+                | head -1 | tr -d '\r\n')
+            [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+        fi
+    done
+    return 1
+}
+
+# То же, но с продолжением поиска в env-files платформы - каталоге, который
+# backup.sh складывает в архив.
 _find_env_value() {
     local cid="$1"; shift
     local k v
-    for k in "$@"; do
-        v=$(sudo timeout 10 docker inspect \
-                --format '{{range .Config.Env}}{{println .}}{{end}}' "${cid}" 2>/dev/null \
-            | sed -n "s/^${k}=//p" | head -1 | tr -d '\r')
-        [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
-    done
+
+    v=$(_container_value "${cid}" "$@") && { printf '%s' "${v}"; return 0; }
+
     for k in "$@"; do
         v=$(grep -rhs "^[[:space:]]*${k}=" "${SCRIPT_DIR}/env-files/" 2>/dev/null \
             | head -1 | cut -d= -f2- | tr -d '"'"'"'\r')
@@ -668,6 +690,14 @@ _pg_connect() {
     _pgq "${cid}" postgres 'select 1' | grep -q '^1$' && return 0
 
     PG_ASUSER=1
+    _pgq "${cid}" postgres 'select 1' | grep -q '^1$' && return 0
+
+    # Последняя попытка: имя базы из POSTGRES_DB нередко совпадает с именем
+    # владельца, а подключение по сокету от него пароля не требует.
+    PG_ASUSER=0
+    u=$(_container_value "${cid}" POSTGRES_DB) || u=""
+    [ -n "${u}" ] || return 1
+    PG_USER="${u}"
     _pgq "${cid}" postgres 'select 1' | grep -q '^1$' && return 0
 
     return 1
