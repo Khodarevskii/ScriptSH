@@ -58,6 +58,9 @@ LOGIN_USER=""
 LOGIN_PASSWORD=""
 PASSWORD_FILE=""
 
+# Дополнительные ключи curl. Заполняются при определении адреса платформы.
+CURL_EXTRA=()
+
 ARCHIVE=""
 DO_RESTORE=1
 DO_TESTS=1
@@ -100,8 +103,9 @@ print_help() {
       --yes           не спрашивать подтверждения (для неинтерактивного запуска)
       --any-version   развернуть архив от другой версии платформы
                       несовпадение станет замечанием вместо отказа
-      --url АДРЕС     базовый адрес для HTTP-проверок
-                      по умолчанию https://127.0.0.1
+      --url АДРЕС     базовый адрес для HTTP-проверок. По умолчанию имя
+                      площадки берётся из конфигурации nginx платформы, а
+                      соединение всё равно идёт на 127.0.0.1
       --wait СЕК      сколько ждать подъёма служб после восстановления
                       по умолчанию 900
       --login-user ИМЯ    проверить, что этот пользователь может войти
@@ -740,11 +744,31 @@ _check_one_clickhouse() {
 # на код возврата curl.
 _http_code() {
     local c
-    c=$(curl -sS -k -o /dev/null -m "${HTTP_TIMEOUT}" -w '%{http_code}' "$1" 2>/dev/null)
+    c=$(curl -sS -k "${CURL_EXTRA[@]}" -o /dev/null -m "${HTTP_TIMEOUT}" -w '%{http_code}' "$1" 2>/dev/null)
     case "${c}" in
         [0-9][0-9][0-9]) printf '%s' "${c}" ;;
         *)               printf '000' ;;
     esac
+}
+
+# Доменное имя платформы из конфигурации её собственного nginx.
+#
+# Обращаться к 127.0.0.1 бесполезно: nginx раздаёт по виртуальному хосту и на
+# запрос без правильного имени отвечает не тем или не отвечает вовсе. Имя берём
+# из действующей конфигурации - "nginx -T" печатает её целиком, вместе со всеми
+# подключаемыми файлами, поэтому искать по каталогам не нужно.
+_nginx_server_name() {
+    local svc cid=""
+    for svc in edge reverse-proxy nginx proxy; do
+        cid=$(resolve_container "${PROJECT}_${svc}")
+        [ -n "${cid}" ] && break
+    done
+    [ -n "${cid}" ] || return 1
+
+    sudo timeout 20 docker exec "${cid}" nginx -T 2>/dev/null \
+        | sed -n 's/^[[:space:]]*server_name[[:space:]]\{1,\}\([^;]*\);.*/\1/p' \
+        | tr ' ' '\n' | tr -d '\r' \
+        | grep -vE '^(_|localhost|\*|)$' | head -1
 }
 
 check_http() {
@@ -755,13 +779,22 @@ check_http() {
         return
     fi
 
-    # Без явного адреса пробуем оба протокола: на локальном адресе платформа
-    # может отвечать по http, а сертификат быть выписан только на внешнее имя.
-    local bases=()
+    local bases=() dom=""
     if [ -n "${HTTP_URL}" ]; then
         bases=("${HTTP_URL%/}")
     else
-        bases=("https://127.0.0.1" "http://127.0.0.1")
+        dom=$(_nginx_server_name) || dom=""
+        if [ -n "${dom}" ]; then
+            # Соединение всё равно идёт на локальный адрес: имя может не
+            # разрешаться на самом сервере, а проверять нужно именно эту машину,
+            # а не то, куда указывает внешний DNS.
+            CURL_EXTRA=(--resolve "${dom}:443:127.0.0.1" --resolve "${dom}:80:127.0.0.1")
+            bases=("https://${dom}" "http://${dom}")
+            log "  адрес из конфигурации nginx: ${dom} (соединение на 127.0.0.1)"
+        else
+            bases=("https://127.0.0.1" "http://127.0.0.1")
+            log "  имя площадки в nginx не найдено, пробую 127.0.0.1"
+        fi
     fi
 
     local base="" code="" b err
@@ -773,7 +806,7 @@ check_http() {
     if [ -z "${base}" ]; then
         # Причину печатает сам curl - без неё непонятно, отказ ли это в
         # соединении, неверное имя или истёкшее время ожидания.
-        err=$(curl -sS -k -o /dev/null -m "${HTTP_TIMEOUT}" "${bases[0]}/" 2>&1 | head -1)
+        err=$(curl -sS -k "${CURL_EXTRA[@]}" -o /dev/null -m "${HTTP_TIMEOUT}" "${bases[0]}/" 2>&1 | head -1)
         check_fail "${bases[0]}/ - нет ответа: ${err:-причина не сообщена}"
         check_warn "Keycloak не проверялся: платформа не отвечает по HTTP"
         return
@@ -794,7 +827,7 @@ check_http() {
     for u in "${base}${KEYCLOAK_PREFIX}/realms/${realm}/.well-known/openid-configuration" \
              "${base}/auth/realms/${realm}/.well-known/openid-configuration" \
              "${base}/realms/${realm}/.well-known/openid-configuration"; do
-        body=$(curl -sS -k -m "${HTTP_TIMEOUT}" "${u}" 2>/dev/null) || body=""
+        body=$(curl -sS -k "${CURL_EXTRA[@]}" -m "${HTTP_TIMEOUT}" "${u}" 2>/dev/null) || body=""
         last=$(_http_code "${u}")
         if printf '%s' "${body}" | grep -q '"issuer"'; then
             check_ok "Keycloak отдаёт конфигурацию realm ${realm}"
@@ -842,7 +875,7 @@ check_login() {
     printf '%s' "${LOGIN_PASSWORD}" > "${pfile}"
 
     local body
-    body=$(curl -sS -k -m "${HTTP_TIMEOUT}" -X POST "${kc}/token" \
+    body=$(curl -sS -k "${CURL_EXTRA[@]}" -m "${HTTP_TIMEOUT}" -X POST "${kc}/token" \
         --data-urlencode "client_id=${LOGIN_CLIENT}" \
         --data-urlencode "grant_type=password" \
         --data-urlencode "scope=${LOGIN_SCOPE}" \
@@ -876,7 +909,7 @@ check_login() {
     cfg=$(mktemp) || { check_warn "не создать временный файл, приём токена не проверен"; return; }
     chmod 600 "${cfg}"
     printf 'header = "Authorization: Bearer %s"\n' "${token}" > "${cfg}"
-    code=$(curl -sS -k -m "${HTTP_TIMEOUT}" -o /dev/null -w '%{http_code}' \
+    code=$(curl -sS -k "${CURL_EXTRA[@]}" -m "${HTTP_TIMEOUT}" -o /dev/null -w '%{http_code}' \
         -K "${cfg}" "${kc}/userinfo" 2>/dev/null) || code="000"
     rm -f "${cfg}"
 
