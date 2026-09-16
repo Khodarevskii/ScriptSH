@@ -97,6 +97,13 @@ PASSWORD_FILE=""
 # сколько ни жди, штатной работы не будет.
 APPLY_CONFIGS=1
 
+# Отправлять ли отчёт по почте и откуда брать настройки. Файл тот же, что у
+# бэкапа: держать два файла с одними и теми же параметрами SMTP - значит
+# однажды поправить один и забыть другой.
+SEND_MAIL=1
+TEST_MAIL=0
+MAIL_ENV="${MAIL_ENV:-/etc/visiology-backup.env}"
+
 # Оставить распакованный каталог после прогона. Нужен разве что для разбора.
 KEEP_BACKUP_DIR=0
 
@@ -158,6 +165,8 @@ print_help() {
                       платформы, перегенерацию конфигураций и запуск. По
                       умолчанию они выполняются - этого требует сам restore.sh,
                       и без них платформа остаётся на прежних настройках
+      --no-mail       не отправлять отчёт по почте
+      --test-mail     отправить проверочное письмо и выйти
       --keep-backup-dir   не чистить распакованный каталог после прогона
       --essential СПИСОК  по каким службам судить о готовности платформы,
                       через запятую. Остальных не ждут, но проверяют
@@ -198,6 +207,8 @@ while [ "$1" != "" ]; do
         --no-stop-services) STOP_SERVICES=0 ;;
         --keep-running) shift; KEEP_RUNNING=$(printf '%s' "$1" | tr ',' ' ') ;;
         --no-apply-configs) APPLY_CONFIGS=0 ;;
+        --no-mail)     SEND_MAIL=0 ;;
+        --test-mail)   TEST_MAIL=1 ;;
         --keep-backup-dir) KEEP_BACKUP_DIR=1 ;;
         --essential)   shift; ESSENTIAL_SERVICES=$(printf '%s' "$1" | tr ',' ' ') ;;
         --ignore)      shift; IGNORE_SERVICES="$1" ;;
@@ -230,6 +241,50 @@ if [ -f "${SCRIPT_DIR}/config.env" ]; then
 else
     log "config.env рядом не найден, беру значения по умолчанию"
 fi
+
+########################################
+# Настройки почты
+########################################
+# Файл разбирается построчно, а не через source: значение с пробелом - список
+# получателей через ", " - bash попытался бы выполнить как команду, а сам файл
+# настроек получил бы право запускать что угодно. Берём только ключи почты:
+# остальное этому скрипту не нужно.
+if [ -r "${MAIL_ENV}" ]; then
+    while IFS= read -r _line || [ -n "${_line}" ]; do
+        _line="${_line%$'\r'}"
+        case "${_line}" in ''|'#'*) continue ;; esac
+        _key="${_line%%=*}"
+        _val="${_line#*=}"
+        case "${_key}" in
+            MAIL_TO|MAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_USE_SSL|SMTP_SKIP_VERIFY|SMTP_USER|SMTP_PASSWORD) ;;
+            *) continue ;;
+        esac
+        case "${_val}" in
+            \"*\") _val="${_val#\"}"; _val="${_val%\"}" ;;
+            \'*\') _val="${_val#\'}"; _val="${_val%\'}" ;;
+        esac
+        printf -v "${_key}" '%s' "${_val}"
+    done < "${MAIL_ENV}"
+    unset _line _key _val
+fi
+
+: "${MAIL_TO:=}"
+: "${MAIL_FROM:=visiology-restore-test@localhost}"
+: "${SMTP_HOST:=localhost}"
+: "${SMTP_PORT:=25}"
+: "${SMTP_USE_TLS:=false}"
+: "${SMTP_USE_SSL:=false}"
+: "${SMTP_SKIP_VERIFY:=true}"
+: "${SMTP_USER:=}"
+: "${SMTP_PASSWORD:=}"
+
+# Путь к журналу нужен письму, чтобы приложить последние строки при аварии. Под
+# cron поток вывода перенаправлен в файл, и его имя видно через /proc. Дескриптор
+# сначала дублируется: внутри подстановки команд fd 1 - это её труба, а не файл.
+exec 8>&1
+LOG_PATH=$(readlink -f /proc/self/fd/8 2>/dev/null) || LOG_PATH=""
+exec 8>&-
+[ -f "${LOG_PATH}" ] || LOG_PATH=""
 
 # Имя стека спрашиваем у самого docker: он знает его точно, а совпадение с
 # config.env не гарантировано, если стек переименовывали.
@@ -656,6 +711,177 @@ wait_services() {
         log "  ещё поднимаются: $(_services_pending_names)(осталось ${left} с)"
         sleep 30
     done
+}
+
+########################################
+# Отчёт по почте
+########################################
+# Письмо собирает и отправляет встроенный обработчик на python3: разбор SMTP,
+# STARTTLS и заголовки с кириллицей на чистом bash пришлось бы писать вручную,
+# а python3 есть в любой поддерживаемой Ubuntu. Внешние пакеты не нужны.
+#
+# Всё передаётся переменными окружения, а не аргументами: пароль не должен
+# попадать в argv, видимый через ps. Ошибка отправки не влияет на исход прогона.
+_mail_send() {
+    local subject="$1" body_file="$2"
+
+    [ -n "${MAIL_TO}" ] || return 0
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 не найден, отчёт не отправлен"
+        return 0
+    fi
+
+    (
+        export MAIL_TO MAIL_FROM SMTP_HOST SMTP_PORT SMTP_USE_TLS SMTP_USE_SSL \
+               SMTP_SKIP_VERIFY SMTP_USER SMTP_PASSWORD
+        export MAIL_SUBJECT="${subject}" MAIL_BODY_FILE="${body_file}"
+        timeout 90 python3 - <<'MAIL_PY'
+"""Отправка отчёта visiology-restore-test.sh. Всё - из окружения."""
+import os
+import smtplib
+import ssl
+import sys
+from email.message import EmailMessage
+
+
+def flag(name, default=False):
+    v = os.environ.get(name, "")
+    if v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on", "da", "да")
+
+
+def main():
+    to = [a.strip() for a in os.environ.get("MAIL_TO", "").split(",") if a.strip()]
+    if not to:
+        return 0
+
+    msg = EmailMessage()
+    msg["From"] = os.environ.get("MAIL_FROM", "visiology-restore-test@localhost")
+    msg["To"] = ", ".join(to)
+    msg["Subject"] = os.environ.get("MAIL_SUBJECT", "visiology-restore-test")
+
+    path = os.environ.get("MAIL_BODY_FILE", "")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError as e:
+        body = "Не удалось прочитать тело письма: %s" % e
+    msg.set_content(body)
+
+    host = os.environ.get("SMTP_HOST", "localhost")
+    port = int(os.environ.get("SMTP_PORT", "25") or 25)
+    use_ssl = flag("SMTP_USE_SSL")
+    use_tls = flag("SMTP_USE_TLS")
+    # Внутренний релей обычно с самоподписанным сертификатом.
+    ctx = ssl._create_unverified_context() if flag("SMTP_SKIP_VERIFY", True) \
+        else ssl.create_default_context()
+
+    try:
+        if use_ssl:
+            srv = smtplib.SMTP_SSL(host, port, timeout=20, context=ctx)
+        else:
+            srv = smtplib.SMTP(host, port, timeout=20)
+        with srv:
+            if use_tls and not use_ssl:
+                srv.starttls(context=ctx)
+            user = os.environ.get("SMTP_USER", "")
+            if user:
+                srv.login(user, os.environ.get("SMTP_PASSWORD", ""))
+            srv.send_message(msg)
+    except Exception as e:
+        # Режим важнее текста ошибки: "timed out" без указания порта и режима
+        # шифрования ничего не объясняет.
+        mode = "SSL" if use_ssl else ("STARTTLS" if use_tls else "без шифрования")
+        print("не удалось отправить отчёт через %s:%s (%s): %s"
+              % (host, port, mode, e), file=sys.stderr)
+        return 1
+    return 0
+
+
+sys.exit(main())
+MAIL_PY
+    ) 2>&1 | while IFS= read -r _l; do warn "${_l}"; done
+    return 0
+}
+
+# Сборка и отправка отчёта. $1 - код возврата прогона.
+send_report() {
+    local rc="$1"
+    [ "${SEND_MAIL}" = "1" ] || return 0
+    [ -n "${MAIL_TO}" ] || return 0
+
+    local body status_word
+    body=$(mktemp /var/tmp/visiology-restore-mail-XXXXXX.txt) || return 0
+
+    if [ "${rc}" -eq 0 ]; then
+        status_word="успешно"
+    elif [ "${rc}" -eq 130 ]; then
+        status_word="ПРЕРВАНО"
+    else
+        status_word="С ОШИБКАМИ"
+    fi
+
+    {
+        echo "Сервер:       $(hostname)"
+        echo "Контур:       Visiology ${VERSION}, проект ${PROJECT}"
+        echo "Начало:       ${T_START_HUMAN}"
+        echo "Длительность: ~$(( ( $(date +%s) - T_START ) / 60 )) мин"
+        echo "Результат:    ${status_word} (код ${rc})"
+        echo
+
+        if [ "${DO_RESTORE}" = "1" ]; then
+            echo "ВОССТАНОВЛЕНИЕ"
+            echo "  Архив:      ${ARCHIVE:-не выбран}"
+            echo "  Код:        ${RESTORE_RC}"
+            [ -n "${RESTORE_BAD_HTTP}" ] \
+                && echo "  ВНИМАНИЕ:   backup-service отвечал кодами ${RESTORE_BAD_HTTP} - базы могли не восстановиться"
+            [ -n "${RESTORE_MARKERS}" ] \
+                && echo "  ВНИМАНИЕ:   в выводе есть признаки ошибок, см. журнал"
+            if [ "${APPLIED_CONFIGS}" = "1" ]; then
+                echo "  Настройки:  применены, платформа перезапущена"
+            else
+                echo "  Настройки:  НЕ применялись"
+            fi
+            [ -n "${RESTORE_LOG}" ] && echo "  Журнал:     ${RESTORE_LOG}"
+            echo
+        fi
+
+        if [ "${DO_TESTS}" = "1" ]; then
+            echo "ПРОВЕРКИ"
+            echo "  Пройдено:   ${CHECKS_OK}"
+            echo "  Замечаний:  ${CHECKS_WARN}"
+            echo "  Отказов:    ${CHECKS_FAIL}"
+            if [ "${CHECKS_FAIL}" -gt 0 ]; then
+                echo
+                echo "  Отказавшие проверки:"
+                printf '    - %s\n' "${FAILED_LIST[@]}"
+            fi
+            echo
+        fi
+
+        if [ -n "${STATE_NOW}" ]; then
+            echo "НАПОЛНЕНИЕ БАЗ"
+            printf '%s\n' "${STATE_NOW}" | sed '/^$/d; s/^/  /'
+            echo
+        fi
+
+        if [ -n "${LOG_PATH}" ]; then
+            echo "Журнал прогона: ${LOG_PATH}"
+            if [ "${rc}" -ne 0 ]; then
+                echo
+                echo "Последние строки журнала:"
+                tail -n 40 -- "${LOG_PATH}" 2>/dev/null | sed 's/^/  /'
+            fi
+        fi
+    } > "${body}"
+
+    local subj="[visiology-restore-test] $(hostname): ${status_word}"
+    [ "${DO_TESTS}" = "1" ] && [ "${CHECKS_FAIL}" -gt 0 ] \
+        && subj="${subj}, отказов ${CHECKS_FAIL}"
+
+    _mail_send "${subj}" "${body}"
+    rm -f "${body}"
 }
 
 ########################################
@@ -1306,12 +1532,51 @@ compare_state() {
 # Ход выполнения
 ########################################
 T_START=$(date +%s)
+T_START_HUMAN=$(date '+%F %T')
 STATE_NOW=""
 RESTORE_LOG=""
 RESTORE_RC=0
 RESTORE_BAD_HTTP=""
 RESTORE_MARKERS=""
 APPLIED_CONFIGS=0
+
+# Единственный обработчик выхода: он и службы вернёт, и отчёт отправит - при
+# любом исходе, включая прерывание с клавиатуры и аварию скрипта. Код возврата
+# снимается первой же командой: любая другая затёрла бы его своим.
+_finish() {
+    local rc=$?
+    trap '' INT TERM EXIT
+    if [ -s "${SERVICES_STATE_FILE}" ]; then
+        warn "прогон завершился, не вернув службы - поднимаю"
+        start_services
+    fi
+    send_report "${rc}"
+    exit "${rc}"
+}
+trap _finish EXIT
+trap 'echo; warn "прервано с клавиатуры"; exit 130' INT TERM
+
+# Проверочное письмо: убедиться, что настройки почты рабочие, не запуская ничего.
+if [ "${TEST_MAIL}" = "1" ]; then
+    if [ -z "${MAIL_TO}" ]; then
+        die "MAIL_TO не задан. Проверьте ${MAIL_ENV}"
+    fi
+    log "отправляю проверочное письмо на ${MAIL_TO} через ${SMTP_HOST}:${SMTP_PORT}"
+    _t=$(mktemp /var/tmp/visiology-restore-mail-XXXXXX.txt)
+    {
+        echo "Проверочное письмо от visiology-restore-test.sh"
+        echo
+        echo "Сервер:   $(hostname)"
+        echo "Время:    $(date '+%F %T')"
+        echo "Настройки взяты из ${MAIL_ENV}"
+        echo "Релей:    ${SMTP_HOST}:${SMTP_PORT}"
+    } > "${_t}"
+    _mail_send "[visiology-restore-test] проверка почты с $(hostname)" "${_t}"
+    rm -f "${_t}"
+    log "готово. Если письмо не пришло - смотрите предупреждения выше"
+    trap - EXIT INT TERM
+    exit 0
+fi
 
 log "=== начало ==="
 log "сервер: $(hostname), проект: ${PROJECT}, версия: ${VERSION:-неизвестна}"
@@ -1331,24 +1596,15 @@ if [ "${DO_RESTORE}" = "1" ]; then
     preflight
     confirm
 
-    if [ "${STOP_SERVICES}" = "1" ]; then
-        # Подъём служб должен произойти при любом исходе - при ошибке
-        # восстановления, при прерывании с клавиатуры, при падении скрипта.
-        # Иначе платформа останется лежать, и это будет хуже неудачного
-        # восстановления.
-        trap 'echo; warn "прервано - поднимаю службы"; start_services; exit 130' INT TERM
-        trap 'start_services' EXIT
-        stop_services
-    fi
+    # Возврат служб при любом исходе обеспечивает обработчик выхода: он видит
+    # запись о погашенных службах и поднимает их, даже если прогон оборвался.
+    [ "${STOP_SERVICES}" = "1" ] && stop_services
 
     run_restore
 
     # Реплики возвращаются до штатного цикла: что именно делает run.sh, мы не
     # знаем, и отдавать ему платформу с погашенными службами неправильно.
-    if [ "${STOP_SERVICES}" = "1" ]; then
-        start_services
-        trap - EXIT INT TERM
-    fi
+    [ "${STOP_SERVICES}" = "1" ] && start_services
 
     if [ "${APPLY_CONFIGS}" = "1" ]; then
         apply_configs
